@@ -626,8 +626,15 @@ get_ip_and_loc() {
         fi
         [ -z "\$ip" ] && ip=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
     fi
+    # 外部查询全部失败时 (如封网断外网) 回退用本机网卡地址, 保证 IP 不至于空白
+    if [ -z "\$ip" ]; then
+        if [ "\$HAS_V4" = "1" ]; then
+            ip=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+        fi
+        [ -z "\$ip" ] && ip=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+    fi
 
-    masked="\$(mask_ip "\$ip")"
+    masked="\$ip"
 
     # 定位降级: 城市-国家 / 国家 / unknown
     local loc
@@ -762,14 +769,15 @@ save_state() {
     cat > "\$STATE_FILE" <<STATE_EOF
 MONTH=\$MONTH
 STATE=\$STATE
-BLOCKED_TIME=\$BLOCKED_TIME
-BLOCKED_TX=\$BLOCKED_TX
-RESTORED_TIME=\$RESTORED_TIME
+BLOCKED_TIME="\$BLOCKED_TIME"
+BLOCKED_TX="\$BLOCKED_TX"
+RESTORED_TIME="\$RESTORED_TIME"
 STATE_EOF
 }
 
-# 检查是否超限
-if [ \$(echo "\$TX_GB >= \$LIMIT" | bc) -eq 1 ]; then
+# 检查是否超限 (用字节级精度比较, 支持 GB 小数上限如 0.001=1MB, 避免 TX_GB 浮点取整误判)
+LIMIT_BYTES=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc)
+if [ \$(echo "\$TX_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
     echo "状态: [警告] 流量已超限，正在禁止出站..."
     log "警告：流量超出限制！正在执行封网策略 (双向封锁)..."
 
@@ -969,7 +977,14 @@ get_ip_and_loc() {
         fi
         [ -z "\$ip" ] && ip=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
     fi
-    masked="\$(mask_ip "\$ip")"
+    # 外部查询全部失败时 (如封网断外网) 回退用本机网卡地址, 保证 IP 不至于空白
+    if [ -z "\$ip" ]; then
+        if [ "\$HAS_V4" = "1" ]; then
+            ip=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+        fi
+        [ -z "\$ip" ] && ip=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+    fi
+    masked="\$ip"
     local loc
     if [ -n "\$city" ] && [ -n "\$cc" ]; then
         loc="\${city}-\${cc}"
@@ -1068,6 +1083,11 @@ unblock_fw() {
 log "已移除本脚本的封网规则 (TRAFFIC_BLOCKED)，网络恢复。"
 
 # 3. 重置 vnStat 数据库 (Debian/Ubuntu 用 systemd，Alpine 用 OpenRC，服务名 vnstatd)
+#    在重置前先采样"上个月"最终出站流量 (重置后数据库清零，用于恢复通知展示)
+LAST_MONTH_TX=\$(get_monthly_tx)
+if [ -n "\$LAST_MONTH_TX" ] && [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null; then
+    log "上个月出站流量: \$(format_traffic "\$LAST_MONTH_TX") (\$LAST_MONTH_TX Bytes)"
+fi
 if command -v rc-service >/dev/null 2>&1; then
     rc-service vnstatd stop 2>/dev/null || true
 else
@@ -1105,15 +1125,23 @@ mkdir -p "\$(dirname "\$STATE_FILE")"
 cat > "\$STATE_FILE" <<STATE_EOF
 MONTH=\$MONTH
 STATE=\$STATE
-BLOCKED_TIME=\$BLOCKED_TIME
-BLOCKED_TX=\$BLOCKED_TX
-RESTORED_TIME=\$RESTORED_TIME
+BLOCKED_TIME="\$BLOCKED_TIME"
+BLOCKED_TX="\$BLOCKED_TX"
+RESTORED_TIME="\$RESTORED_TIME"
 STATE_EOF
 
 if [ "\$NEED_RESTORE" -eq 1 ]; then
 IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
     RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
     MONTH_TX=\$(get_monthly_tx)
+    # 上个月(重置前周期)最终流量: 优先用步骤3采样值, 若为0则回退到 max(当前,采样)
+    LAST_MONTH_OK=0
+    if [ -n "\$LAST_MONTH_TX" ] && [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null; then
+        LAST_MONTH_OK=1
+    elif [ "\$MONTH_TX" -gt 0 ] 2>/dev/null; then
+        LAST_MONTH_TX="\$MONTH_TX"
+        LAST_MONTH_OK=1
+    fi
     # CPU 行 (仅 oracle 显示)
     CPU_LINE=""
     if is_oracle_platform; then
@@ -1121,12 +1149,19 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 CPU: \$(get_cpu_type)"
     fi
 
+    # 本月流量/上限 恒显示; 有上月(重置前)记录时附加展示
+    LAST_MONTH_LINE=""
+    if [ "\$LAST_MONTH_OK" = "1" ]; then
+        LAST_MONTH_LINE="
+📊 上个月流量: \$(format_traffic "\$LAST_MONTH_TX") (重置前出站耗尽)"
+    fi
+
     TG_MSG="🎮 \$PLATFORM 流量报告（网络恢复通知）
 
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 超限封网 ---> 已恢复
-🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${CPU_LINE}"
+🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${LAST_MONTH_LINE}\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
     log "已发送网络恢复 TG 通知。"
