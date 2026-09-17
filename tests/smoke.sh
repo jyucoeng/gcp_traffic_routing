@@ -34,18 +34,19 @@ T="trojan://password123456@5.6.7.8:443#troj"
 H2="hysteria2://h2pass@4.4.4.4:8443?sni=example.com&insecure=1#h2"
 TU="tuic://uuid:tok@7.7.7.7:7777?sni=x#tuic"
 ANYTLS="anytls://apass@8.8.8.8:443?insecure=1&sni=example.com#a"
-VMESS="vmess://eyJ2IjoiMiJ9"
+# 虚构测试数据：多行 pretty-print Base64 的 vmess 链接（符合真实格式但内容为假）
+VMESS="vmess://ewogICJ2IjogIjIiLAogICJwcyI6ICJzbW9rZS10ZXN0LW5vZGUiLAogICJhZGQiOiAiMjAzLjAuMTEzLjEwIiwKICAicG9ydCI6ICI0NDMiLAogICJpZCI6ICIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDAiLAogICJhaWQiOiAiMCIsCiAgInNjeSI6ICJub25lIiwKICAibmV0IjogIndzIiwKICAidHlwZSI6ICJub25lIiwKICAiaG9zdCI6ICJzbW9rZS10ZXN0LmV4YW1wbGUuY29tIiwKICAicGF0aCI6ICIvd3M/ZWQ9MjU2MCIsCiAgInRscyI6ICJ0bHMiLAogICJzbmkiOiAic21va2UtdGVzdC5leGFtcGxlLmNvbSIsCiAgImFscG4iOiAiIiwKICAiZnAiOiAiY2hyb21lIiwKICAiaW5zZWN1cmUiOiAiMCIKfQ=="
 SS="ss://YWVzLTI1Ni1nY206Zm9v@9.9.9.9:8388#ss"
 HTTP="http://blog.example.com/token"
 VERYBAD="not-a-link"
 
 # ---------- cdn_valid_link ----------
 assert_true  "cdn_valid_link '${V}'"    "valid_link 接受 vless://"
+assert_true  "cdn_valid_link '${VMESS}'" "valid_link 接受 vmess://"
 assert_true  "cdn_valid_link '${T}'"    "valid_link 接受 trojan://"
 assert_true  "cdn_valid_link '${H2}'"   "valid_link 接受 hysteria2://"
 assert_true  "cdn_valid_link '${TU}'"   "valid_link 接受 tuic://"
 assert_true  "cdn_valid_link '${ANYTLS}'" "valid_link 接受 anytls://"
-assert_false "cdn_valid_link '${VMESS}'" "valid_link 拒绝 vmess://"
 assert_false "cdn_valid_link '${SS}'"   "valid_link 拒绝 ss://"
 assert_false "cdn_valid_link '${HTTP}'" "valid_link 拒绝 http://"
 assert_false "cdn_valid_link '${VERYBAD}'" "valid_link 拒绝非链接"
@@ -70,6 +71,8 @@ else
 fi
 assert_eq "$(cdn_mask_link 'trojan://pw@6.6.6.6:443?x=1#t')" \
   "trojan://#$(sha256_str 'pw' | cut -c1-6)@6.6.6.6:443" "mask_link 兼容 trojan"
+assert_eq "$(cdn_mask_link "${VMESS}")" \
+  "vmess://#$(sha256_str "${VMESS#vmess://}" | cut -c1-6)" "mask_link 兼容 vmess(Base64 整段掩码)"
 assert_eq "$(cdn_mask_link "${H2}")" \
   "hysteria2://#$(sha256_str 'h2pass' | cut -c1-6)@4.4.4.4:8443" "mask_link 兼容 hysteria2"
 assert_eq "$(cdn_mask_link "${TU}")" \
@@ -134,8 +137,9 @@ fi
 
 # ---------- cdn_add：去重与非法输入 ----------
 NODE_BEFORE="$(cdn_read_nodes | wc -l | tr -d ' ')"
-CDN_NO_APPLY=1 cdn_add "${T}" "${VMESS}"
+CDN_NO_APPLY=1 cdn_add "${T}" "${SS}"
 NODE_AFTER="$(cdn_read_nodes | wc -l | tr -d ' ')"
+
 assert_eq "${NODE_AFTER}" "${NODE_BEFORE}" "cdn_add 去重已存在节点 + 忽略非法协议不写盘"
 
 # ---------- is_num ----------

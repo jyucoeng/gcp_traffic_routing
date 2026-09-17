@@ -10,7 +10,7 @@ set -eEuo pipefail
 # 背景：GCP 免费实例的出站流量对部分 CDN 网段（Cloudflare/Fastly/Akamai 等，
 # geodata 中的 cdnip 标签）单独计费且很贵。本脚本在本机安装 dae（eBPF 透明
 # 代理），按"目的 IP 是否命中 cdnip 网段"分流：命中的统统治经你提供的
-# vless/trojan/hysteria2/tuic/anytls 节点（免费/便宜节点）中转，其余流量直连，从而避免 GCP
+# vless/vmess/trojan/hysteria2/tuic/anytls 节点（免费/便宜节点）中转，其余流量直连，从而避免 GCP
 # 对本机
 # 到 CDN 出站的高额计费。
 #
@@ -18,7 +18,7 @@ set -eEuo pipefail
 #   cdn              同 install（TTY 下显示交互菜单：1安装 2设置分流节点 3全量卸载 4退出）
 #   cdn install      安装/更新 dae + cdnip geoip 数据库，并生成配置
 #   cdn update       强制重下 dae 二进制与 geoip 数据库，然后重新 apply
-#   cdn add <链接...>      添加节点（vless/trojan/hysteria2/tuic/anytls），自动 apply
+#   cdn add <链接...>      添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），自动 apply
 #   cdn add-sub <url> [标签]  添加订阅，自动 apply
 #   cdn del <匹配>         按序号(1 起)或关键字删除节点，自动 apply
 #   cdn del-sub <匹配>     按序号或关键字删除订阅，自动 apply
@@ -46,6 +46,10 @@ set -eEuo pipefail
 ###############################################################################
 
 SCRIPT_VERSION="0.1.0"
+
+# 项目显示名（菜单标题等处使用）。Fork 本仓库后如想改显示名，改这里即可；
+# 但发布包/安装脚本的仓库名仍以 install.sh 顶部 REPO_NAME 为准。
+PROJECT_NAME="gcp_traffic_routing"
 
 DAE_BIN="${DAE_BIN:-/usr/local/bin/dae}"
 DAE_DATA_DIR="/usr/local/share/dae"
@@ -333,10 +337,10 @@ cdn_detect_lan_iface() {
   return 0
 }
 
-# 节点链接校验：接受 vless / trojan / hysteria2 / tuic / anytls（其余协议不在本脚本支持范围）
+# 节点链接校验：接受 vless / vmess / trojan / hysteria2 / tuic / anytls（其余协议不在本脚本支持范围）
 cdn_valid_link() {
   case "$1" in
-  vless://* | trojan://* | hysteria2://* | tuic://* | anytls://*)
+  vless://* | vmess://* | trojan://* | hysteria2://* | tuic://* | anytls://*)
     return 0
     ;;
   *)
@@ -354,6 +358,7 @@ cdn_read_subs() {
 }
 
 # 节点链接掩码显示：协议 + 掩码凭据摘要 + host:port（剥离 query 与 # 片段）
+# vmess 为标准 Base64(JSON) 链接、无 @host:port 结构，整段均视为凭据 → 整体掩码。
 cdn_mask_link() {
   local link="$1" proto rest hostport secret fp clean
   proto="${link%%://*}"
@@ -365,6 +370,9 @@ cdn_mask_link() {
   if [ "${secret}" != "${rest}" ] && [ -n "${secret}" ]; then
     fp="$(sha256_str "${secret}")"
     printf '%s://#%s@%s' "${proto}" "${fp:0:6}" "${clean}"
+  elif [ "${proto}" = "vmess" ] && [ -n "${rest}" ]; then
+    fp="$(sha256_str "${rest}")"
+    printf '%s://#%s' "${proto}" "${fp:0:6}"
   else
     printf '%s://%s' "${proto}" "${clean}"
   fi
@@ -605,7 +613,7 @@ cdn_log() {
 
 cdn_list() {
   local i line
-  echo -e "${BLUE}== 节点（vless/trojan，凭据已掩码）==${PLAIN}"
+  echo -e "${BLUE}== 节点（vless/vmess/trojan/hysteria2/tuic/anytls，凭据已掩码）==${PLAIN}"
   if [ -f "${CDN_NODES}" ]; then
     i=0
     while IFS= read -r line; do
@@ -662,7 +670,7 @@ cdn_add_impl() {
       link="${link%\"}"
       link="${link#\"}"
   if ! cdn_valid_link "${link}"; then
-    cdn_print_warn "跳过非法节点链接（仅支持 vless/trojan/hysteria2/tuic/anytls）：${link:0:60}…"
+    cdn_print_warn "跳过非法节点链接（仅支持 vless/vmess/trojan/hysteria2/tuic/anytls）：${link:0:60}…"
         bad=1
         continue
       fi
@@ -789,7 +797,7 @@ cdn_install() {
     cdn_apply
   else
     cdn_write_config || true
-    cdn_print_info "已就绪。接下来用 cdn add 添加节点（vless/trojan/hysteria2/tuic/anytls），全部流量将按 dip(geoip:cdnip) 分流。"
+    cdn_print_info "已就绪。接下来用 cdn add 添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），全部流量将按 dip(geoip:cdnip) 分流。"
     cdn_print_info "示例: cdn add 'vless://uuid@node.example.com:443?...' 'trojan://pass@node2.example.com:443'"
   fi
 }
@@ -890,10 +898,10 @@ cdn_menu_uninstall() {
 cdn_menu() {
   local choice
   while :; do
-    printf '\n%s\n' "gcp_traffic_routing 管理器（dae CDN 分流）"
+    printf '\n%s\n' "${PROJECT_NAME} 管理器（dae CDN 分流）"
     printf '%s\n'   "=============================="
     printf '1) 安装（dae + geoip + 配置）\n'
-    printf '2) 设置分流节点（添加 vless/trojan）\n'
+    printf '2) 设置分流节点（vless/vmess/trojan/hysteria2/tuic/anytls）\n'
     printf '3) 全量卸载\n'
     printf '4) 退出\n'
     if ! read -r -p "请选择 [1-4]: " choice; then
@@ -932,7 +940,7 @@ print_usage() {
   install           安装/更新 dae + cdnip geoip 数据库并生成配置
   menu              交互菜单：安装 / 设置分流节点 / 全量卸载 / 退出
   update              强制重下 dae 二进制与 geoip 数据库，然后重新 apply
-  add <vless://…> [<trojan://…> …]   添加节点（vless/trojan/hysteria2/tuic/anytls），自动 apply
+  add <vless://…> [<trojan://…> …]   添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），自动 apply
   add-sub <url> [标签]  添加订阅，自动 apply
   del <序号|关键字>     删除节点（按 cdn list 中的序号或链接关键字）
   del-sub <序号|关键字> 删除订阅

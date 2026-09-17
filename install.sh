@@ -3,20 +3,20 @@ set -eEuo pipefail
 
 umask 077
 
-REPO_OWNER="jyucoeng"
-REPO_NAME="gcp_traffic_routing"
-PROJECT_VERSION="v0.1.0"
-PACKAGE_NAME="gcp_traffic_routing-v0.1.0.tar.gz"
+# =============================================================================
+# 项目标识常量 —— Fork 本仓库后，只需修改下方两者（REPO_OWNER / REPO_NAME）
+# 即可变成你自己的项目，其余脚本（build/check）会自动从本文件读取这些值。
+# 发布时还需在 GitHub 用相同名字创建 Release 并回填 PACKAGE_SHA256。
+# =============================================================================
+REPO_OWNER="jyucoeng"                 # 你的 GitHub 用户名
+REPO_NAME="gcp_traffic_routing"       # 你的仓库名（保持与仓库 URL 一致）
+PROJECT_VERSION="v0.1.0"              # 发布版本号（与 VERSION 文件一致）
+PACKAGE_NAME="${REPO_NAME}-${PROJECT_VERSION}.tar.gz"   # 由上方常量派生，无需手改
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256=""
+PACKAGE_SHA256="3fd17778b3305637d82ec2cfd9d0eb91879780966ef2d51d84c074f9c38c2e94"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"
-
-if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-  echo "请使用 root 用户运行。" >&2
-  exit 1
-fi
 
 download() {
   local url="$1"
@@ -79,6 +79,10 @@ install_bundle() {
 }
 
 main() {
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "请使用 root 用户运行。" >&2
+    exit 1
+  fi
   local bundle
   bundle="$(mktemp)"
   if ! download "${PACKAGE_URL}" "${bundle}"; then
@@ -89,15 +93,18 @@ main() {
   verify_bundle "${bundle}"
   install_bundle "${bundle}"
   rm -f "${bundle}"
-  echo "gcp_traffic_routing ${PROJECT_VERSION} 安装完成：${CDN_BIN}"
+  echo "${REPO_NAME} ${PROJECT_VERSION} 安装完成：${CDN_BIN}"
 
   # 设了 cdnt 即自动初始化（安装 dae + geoip + 生成配置）
   if [ -n "${cdnt:-}" ]; then
     bash "${CDN_BIN}" || {
-      echo "gcp_traffic_routing 初始化失败。" >&2
+      echo "${REPO_NAME} 初始化失败。" >&2
       exit 1
     }
   fi
 }
 
-main "$@"
+# 测试钩子：INSTALL_TEST_MODE=1 时供 tests/test-install.sh source 本文件做函数级验证
+if [ "${INSTALL_TEST_MODE:-0}" != "1" ]; then
+  main "$@"
+fi

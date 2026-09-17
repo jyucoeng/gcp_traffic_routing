@@ -8,7 +8,7 @@ GCP 对出站到部分 CDN 网段（Cloudflare / Fastly / Akamai 等，geodata �
 单独计费且很贵。本项目在本机安装 [dae](https://github.com/daeuniverse/dae)（eBPF 透明代理），
 按"目的 IP 是否命中 `cdnip` 网段"分流：
 
-- 命中 CDN 网段 → 走你提供的 vless/trojan/hysteria2/tuic/anytls 节点（免费/便宜节点）中转
+- 命中 CDN 网段 → 走你提供的 vless/vmess/trojan/hysteria2/tuic/anytls 节点（免费/便宜节点）中转
 - 其余流量 → 直接连接
 
 从而避开 GCP 对本机到 CDN 出站的高额计费。
@@ -39,7 +39,7 @@ cdn            # 安装 dae + geoip + 配置（需 root）
 | `cdn menu` | 显示交互菜单 |
 | `cdn install` | 安装/更新 dae + cdnip geoip 数据库，并生成配置 |
 | `cdn update` | 强制重下 dae 二进制与 geoip 数据库后重新 apply |
-| `cdn add <链接...>` | 添加节点（`vless://` `trojan://` `hysteria2://` `tuic://` `anytls://`），自动 apply |
+| `cdn add <链接...>` | 添加节点（`vless://` `vmess://` `trojan://` `hysteria2://` `tuic://` `anytls://`），自动 apply |
 | `cdn add-sub <url> [标签]` | 添加订阅，自动 apply |
 | `cdn del <序号\|关键字>` | 删除节点，自动 apply |
 | `cdn del-sub <序号\|关键字>` | 删除订阅，自动 apply |
@@ -75,7 +75,79 @@ cdn            # 安装 dae + geoip + 配置（需 root）
 scripts/build-release-bundle.sh   # 构建可复现 bundle 到 dist/
 scripts/check-version.sh          # 版本一致性 + bundle 哈希门禁
 tests/smoke.sh                    # 纯函数冒烟测试
+tests/test-install.sh             # install.sh 函数级测试
 ```
 
 bundle 为字节级可复现产物（`tar --format=gnu` + `gzip -n`），`install.sh` 内
 `PACKAGE_SHA256` 与其严格一致。
+
+## Fork 并弄成你自己的项目
+
+项目采用**单一事实源**设计：所有仓库/项目标识都从 `install.sh` 顶部常量派生，
+Fork 后绝大部分情况只需改 `install.sh` 一处。
+
+### 一、改你的标识（必需）
+
+打开 `install.sh` 顶部（约第 6-12 行）：
+
+```bash
+REPO_OWNER="jyucoeng"             # 改成你自己的 GitHub 用户名
+REPO_NAME="gcp_traffic_routing"   # 改成你的仓库名（保持与仓库 URL 一致）
+```
+
+其余脚本（`build-release-bundle.sh` / `check-version.sh`）会自动 `source` 该文件读取，
+无需手动改。版本号在 `VERSION` 文件与 `install.sh` 的 `PROJECT_VERSION`（两者须一致）。
+
+可选：想改菜单显示名，编辑 `cdn.sh` 顶部 `PROJECT_NAME`（不影响发布包命名）。
+
+### 二、迭代开发验证（本地）
+
+```bash
+bash tests/smoke.sh               # cdn.sh 功能
+bash tests/test-install.sh        # install.sh 功能
+bash scripts/check-version.sh     # 版本/语法门禁（此时 SHA 为空，报缺 SHA 属预期）
+```
+
+### 三、发布（GNU tar 环境，如 Debian/Ubuntu）
+
+```bash
+bash scripts/build-release-bundle.sh   # 产出 dist/<仓库名>-<版本>.tar.gz 与 checksums.txt
+cat dist/checksums.txt                 # 拿到 64 位 sha256
+```
+
+把该哈希填回 `install.sh` 顶部：
+
+```bash
+PACKAGE_SHA256="<64位哈希>"
+```
+
+再次验证全绿：
+
+```bash
+bash scripts/check-version.sh     # 应全部 ✅
+```
+
+### 四、建 GitHub Release 并发布
+
+1. 把 `install.sh`（含已回填哈希）提交推送到你的仓库；
+2. 在 GitHub `Releases` 页面新建 tag `v<版本>`（如 `v0.1.0`），
+   标题写版本号；
+3. 上传两个资产文件：
+   - `dist/<仓库名>-<版本>.tar.gz`
+   - `install.sh`
+4. 发布。
+
+> 资产名必须与 `PACKAGE_NAME` 完全一致（`<仓库名>-<版本>.tar.gz`），
+> 因为 `install.sh` 用同名 URL 下载。
+
+### 五、用户侧一条命令安装
+
+仓库首页的 `README.md` 安装命令会自动指向你的 repo/Release（安装 URL 用
+`${REPO_OWNER}/${REPO_NAME}` 构造），无需改动作。
+
+```bash
+curl -fsSL https://github.com/<你的用户名>/<你的仓库名>/releases/latest/download/install.sh | bash
+```
+
+如需把示例里的仓库名也替换掉，可搜索并替换 `README.md` 中残留的
+`jyucoeng/gcp_traffic_routing`。
