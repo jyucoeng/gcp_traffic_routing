@@ -6,7 +6,7 @@
 # 1. 自动获取网卡，只监控出站流量 (TX)
 # 2. 运行 check_traffic.sh 时终端显示精确流量，日志保留简略信息
 # 3. 每月重置流量并删除旧的监控日志
-# 4. 超限后双向封网 (INPUT + OUTPUT 全部 DROP)，仅保留 SSH / DNS / lo
+# 4. 超限后双向封锁 (INPUT + OUTPUT + FORWARD DROP)，仅保留 SSH(入/出双向永放行)/DNS/lo
 # 5. oracle 平台自动停用 firewalld / ufw，避免与 iptables 冲突
 # 6. TG 通知（可选）：断网前发一条、每月1号恢复发一条
 #
@@ -44,7 +44,8 @@ PLATFORM="${PLATFORM:-gcp}"
 # 留空时按 PLATFORM 自动设置: gcp=180, oracle=9216；其他平台请务必手动指定
 LIMIT="${LIMIT:-}"
 
-# SSH 端口，封网后仅放行此端口用于远程管理
+# SSH 端口，超限双向封网后仍双向放行的端口 (INPUT 入站握手 + OUTPUT 回包)，保证远程管理不断线。
+# 注意: 填 VPS 内部 sshd 实际监听的端口；外部经 NAT/跳板映射的端口与此无关 (NAT 在 VPS 之外, VPS 只见内部端口)。
 SSH_PORT="${SSH_PORT:-22}"
 # DNS 服务器，封网后允许的 DNS 查询；支持 IPv4/IPv6 混列。
 # 留空时自动按地址族选择：IPv4 用 8.8.8.8 8.8.4.4；纯 IPv6 用 Google IPv6 DNS (2001:4860:4860::8888/8844)。
@@ -769,19 +770,19 @@ STATE_EOF
 
 # 检查是否超限
 if [ \$(echo "\$TX_GB >= \$LIMIT" | bc) -eq 1 ]; then
-    echo "状态: [警告] 流量已超限，正在封网..."
-    log "警告：流量超出限制！正在执行封禁策略..."
+    echo "状态: [警告] 流量已超限，正在禁止出站..."
+    log "警告：流量超出限制！正在执行封网策略 (双向封锁)..."
 
-    # ---- 仅当本次由正常转为断网时才发送断网通知 (同一事件周期只发一次) ----
+    # ---- 仅当本次由正常转为超限时才发送通知 (同一事件周期只发一次) ----
     if [ "\$STATE" != "blocked" ]; then
         STATE=blocked
         BLOCKED_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
         BLOCKED_TX="\$TX_BYTES"
         save_state
 
-        # 断网之前发送 TG 通知 (TG 启用时)
+        # 超限时发送 TG 通知 (TG 启用时)
         if [ "\$TG_ON" = "1" ]; then
-            IFS='\|' IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
+            IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
             RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
             MONTH_TX=\$TX_BYTES
             # CPU 行 (仅 oracle 显示)
@@ -792,25 +793,27 @@ if [ \$(echo "\$TX_GB >= \$LIMIT" | bc) -eq 1 ]; then
             fi
 
             # 组装通知文本 (oracle 时含 CPU 行)
-TG_MSG="🎮 \$PLATFORM 流量报告（断网通知）
+TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
-📚 网络状态: 正常 ---> 断网
+📚 网络状态: 正常 ---> 超限(双向封网)
 🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${CPU_LINE}"
 
             tg_send "\$TG_MSG"
-            log "已发送断网 TG 通知。"
+            log "已发送流量超限 TG 通知。"
         fi
     else
-        echo "    (本周期已发送断网通知，跳过。)"
-        log "本周期已发送断网通知，跳过。"
+        echo "    (本周期已发送超限通知，跳过。)"
+        log "本周期已发送超限通知，跳过。"
     fi
 
-    # ---- 封禁策略 (双向封锁，仅影响本脚本内容) ----
+    # ---- 封禁策略 (双向封锁: INPUT + OUTPUT + FORWARD, 仅放行 SSH/DNS/lo) ----
     # 支持 IPv4 + IPv6：按 HAS_V4/HAS_V6 分别操作 iptables / ip6tables；
     # DNS 服务器按地址族分流；ICMP 协议 v4=icmp / v6=ipv6-icmp。
     # 不改变全局默认策略(-P)、不全局清空(-F/-X)，只操作自家 TRAFFIC_BLOCKED 链。
+    # SSH 双向按方向匹配: INPUT 放行目标 dport (入站握手), OUTPUT 放行源 sport (SSH 回包)，
+    # 即使外部经 NAT/跳板映射端口，VPS 只见 sshd 内部端口，填内部端口即可保证不锁死。
     apply_fw() {
         local FW="\$1" ICMP_PROTO="\$2"
         # 创建或复用自家链 (已存在则清空重建)
@@ -818,8 +821,9 @@ TG_MSG="🎮 \$PLATFORM 流量报告（断网通知）
 
         # 放行已建立的连接 (关键: 确保封网瞬间不打断当前 SSH 会话)
         "\$FW" -A TRAFFIC_BLOCKED -m state --state ESTABLISHED,RELATED -j ACCEPT
-        # 放行 SSH 管理端口
+        # 放行 SSH 管理端口 (双向: INPUT 入站握手 + OUTPUT 回包; 覆盖新 SSH 会话)
         "\$FW" -A TRAFFIC_BLOCKED -p tcp --dport "\$SSH_PORT" -j ACCEPT
+        "\$FW" -A TRAFFIC_BLOCKED -p tcp --sport "\$SSH_PORT" -j ACCEPT
         # 放行 DNS 查询 (按地址族匹配)
         for DNS in \$DNS_SERVERS; do
             case "\$DNS" in
@@ -829,15 +833,15 @@ TG_MSG="🎮 \$PLATFORM 流量报告（断网通知）
             "\$FW" -A TRAFFIC_BLOCKED -p udp --dport 53 -d "\$DNS" -j ACCEPT
             "\$FW" -A TRAFFIC_BLOCKED -p tcp --dport 53 -d "\$DNS" -j ACCEPT
         done
-        # 放行 ICMP / ICMPv6 (ping)
+        # 放行 ICMP / ICMPv6 (ping / NDP 邻居发现, IPv6 必需)
         "\$FW" -A TRAFFIC_BLOCKED -p "\$ICMP_PROTO" -j ACCEPT
-        # 放行 loopback
+        # 放行 loopback (入/出)
         "\$FW" -A TRAFFIC_BLOCKED -i lo -j ACCEPT
-        # 链内兜底 DROP: 未放行的流量在此终结，不回到主链(不影响其他规则)
+        "\$FW" -A TRAFFIC_BLOCKED -o lo -j ACCEPT
+        # 链内兜底 DROP: 其余流量在此终结，不回到主链(不影响其他规则)
         "\$FW" -A TRAFFIC_BLOCKED -j DROP
 
-        # 在主链最顶部各插入一条跳转到 TRAFFIC_BLOCKED (仅本脚本三条)
-        # 覆盖 INPUT / OUTPUT / FORWARD，实现真正全局封网；
+        # 在三条主链最顶部各插入一条跳转到 TRAFFIC_BLOCKED (全局封锁)
         # 用 -I 1 插到最前，确保封网生效；不动各链已有的其他规则与默认策略
         "\$FW" -I INPUT   1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
         "\$FW" -I OUTPUT  1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
@@ -846,11 +850,11 @@ TG_MSG="🎮 \$PLATFORM 流量报告（断网通知）
     [ "\$HAS_V4" = "1" ] && command -v iptables  >/dev/null 2>&1 && apply_fw iptables  icmp
     [ "\$HAS_V6" = "1" ] && command -v ip6tables >/dev/null 2>&1 && apply_fw ip6tables ipv6-icmp
 
-    log "网络已限制 (TRAFFIC_BLOCKED 全局封锁，仅保留 SSH / DNS / lo)。"
+    log "网络已限制 (TRAFFIC_BLOCKED 双向封锁，仅保留 SSH / DNS / lo)。"
 else
     echo "状态: [正常] 流量未超限。"
 
-    # 若曾在断网状态，但当前流量已回落则状态归位 normal (不发恢复通知，恢复通知由 reset 触发)
+    # 若曾在超限状态，但当前流量已回落则状态归位 normal (不发恢复通知，恢复通知由 reset 触发)
     if [ "\$STATE" = "blocked" ]; then
         STATE=normal
         save_state
@@ -1041,13 +1045,18 @@ else
 fi
 
 # 2. 重置防火墙规则 (IPv4 + IPv6)
-# 只移除本脚本的封网规则 (TRAFFIC_BLOCKED 链及三条跳转规则)，不影响其他程序
+# 只移除本脚本的出站封禁规则 (TRAFFIC_BLOCKED 链及 OUTPUT 跳转规则)，不影响其他程序
 unblock_fw() {
     local FW="\$1"
     command -v "\$FW" >/dev/null 2>&1 || return 0
+    # 仅清理本脚本的跳转 (兼容新旧注释；只删带自身注释的跳转，不动其他程序规则)
     "\$FW" -D INPUT    -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null
     "\$FW" -D OUTPUT   -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null
     "\$FW" -D FORWARD  -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null
+    "\$FW" -D INPUT    -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null
+    "\$FW" -D OUTPUT   -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null
+    "\$FW" -D FORWARD  -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null
+    # 兼容旧版本(无注释的裸跳转也一并删除，仅限本脚本曾用)
     "\$FW" -D INPUT    -j TRAFFIC_BLOCKED 2>/dev/null
     "\$FW" -D OUTPUT   -j TRAFFIC_BLOCKED 2>/dev/null
     "\$FW" -D FORWARD  -j TRAFFIC_BLOCKED 2>/dev/null
@@ -1082,7 +1091,7 @@ log "vnStat 数据库已重置 (接口: \$INTERFACE)。"
 #    在防火墙已全部放开之后发送 (此时网络可用，能获取 IP)
 sleep 1
 
-# 判定是否需要发恢复通知: 仅当 STATE=blocked (即上个周期确实断过网) 才需要
+# 判定是否需要发恢复通知: 仅当 STATE=blocked (即上个周期确实超限封网过) 才需要
 NEED_RESTORE=0
 if [ "\$STATE" = "blocked" ] && [ "\$TG_ON" = "1" ]; then
     NEED_RESTORE=1
@@ -1116,7 +1125,7 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
-📚 网络状态: 断网----网络恢复
+📚 网络状态: 超限封网 ---> 已恢复
 🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
@@ -1173,8 +1182,8 @@ echo "当前配置："
 echo "  平台       : $PLATFORM"
 echo "  流量上限   : $LIMIT GB"
 echo "  SSH 端口   : $SSH_PORT"
-echo "  封网策略   : 超限时双向封锁 (INPUT+OUTPUT DROP)"
-echo "             仅保留 SSH / DNS / lo 通行"
+echo "  封网策略   : 超限时双向封锁 (INPUT+OUTPUT+FORWARD DROP)"
+echo "             仅放行 SSH(入/出双向)/DNS/lo；转发至其他 VPS 的流量一并拦截"
 if [ "$TG_ENABLED" = "1" ]; then
     echo "  TG 通知    : 已启用 (凭据已加密存储，断网/恢复时通知)"
 else

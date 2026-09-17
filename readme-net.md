@@ -36,7 +36,7 @@
 |------|------|------|
 | `PLATFORM` | 平台标识，**建议统一小写**。内置特殊处理 `gcp`/`oracle`；其他任意标识（如 `aws`/`azure`/`hetzner`/`custom`）也可用，仅需手动指定 `LIMIT` | `gcp` |
 | `LIMIT` | 出站流量上限（GB），超限触发封网。留空则按平台自动 | gcp=`180`，oracle=`9216`(9TB) |
-| `SSH_PORT` | 封网后仅放行的 SSH 管理端口 | `22` |
+| `SSH_PORT` | 封网后仅放行的 SSH 管理端口。**填 VPS 内部 sshd 实际监听的端口**，与外部连接端口无关（见下方 NAT 机说明） | `22` |
 | `DNS_SERVERS` | 封网后允许的 DNS 服务器，支持 IPv4/IPv6 混列；留空则按地址族自动选 | IPv4：`8.8.8.8 8.8.4.4`；纯 IPv6：`2001:4860:4860::8888 2001:4860:4860::8844` |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot 的 token（`@BotFather` 创建） | 空（不启用通知） |
 | `TELEGRAM_CHAT_ID` | 接收通知的 chat id | 空（不启用通知） |
@@ -155,7 +155,7 @@ PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root
 > 即 `check_traffic.sh` 每 5 分钟执行一次；`reset_network.sh` 每月 1 号零点执行一次。如需调整频率，改部署脚本里对应的 crontab 行后重新部署。
 
 ### 4. 封网策略（全局封锁，仅影响本脚本，不干扰其他程序）
-超限后，本脚本**只操作自己创建的 `TRAFFIC_BLOCKED` 链**，不改全局默认策略、不全局清空，**不影响其他程序已有的防火墙规则**。封网范围覆盖 **INPUT / OUTPUT / FORWARD 三条链**，实现真正全局封锁。**根据探测到的地址族**，IPv4 用 `iptables`、IPv6 用 `ip6tables`（含 `ip6tables` 专用的 `ipv6-icmp` 放行、IPv6 DNS 分流），双栈机两者同时生效。
+超限后，本脚本**只操作自己创建的 `TRAFFIC_BLOCKED` 链**，不改全局默认策略、不全局清空，**不影响其他程序已有的防火墙规则**。封网范围覆盖 **INPUT / OUTPUT / FORWARD 三条链**，实现真正全局封锁（**含转发至其他 VPS 的中转流量**，同样被 FORWARD 拦截）。**根据探测到的地址族**，IPv4 用 `iptables`、IPv6 用 `ip6tables`（含 `ip6tables` 专用的 `ipv6-icmp` 放行、IPv6 DNS 分流），双栈机两者同时生效。
 
 封网时执行（以 IPv4 为例，IPv6 用 `ip6tables` 对应执行）：
 ```bash
@@ -163,7 +163,9 @@ PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root
 iptables -N TRAFFIC_BLOCKED 2>/dev/null || iptables -F TRAFFIC_BLOCKED
 # 链内放行：已建立连接、SSH、DNS、ICMP、loopback
 iptables -A TRAFFIC_BLOCKED -m state --state ESTABLISHED,RELATED -j ACCEPT
+# SSH 双向按方向匹配：INPUT 放行目标 dport（入站握手），OUTPUT 放行源 sport（SSH 回包）
 iptables -A TRAFFIC_BLOCKED -p tcp --dport $SSH_PORT -j ACCEPT
+iptables -A TRAFFIC_BLOCKED -p tcp --sport $SSH_PORT -j ACCEPT
 iptables -A TRAFFIC_BLOCKED -p udp --dport 53 -d <DNS> -j ACCEPT   # 各 DNS 服务器(按地址族分别加入 iptables/ip6tables)
 iptables -A TRAFFIC_BLOCKED -p icmp -j ACCEPT                      # IPv6 用: -p ipv6-icmp
 iptables -A TRAFFIC_BLOCKED -i lo -j ACCEPT
@@ -177,11 +179,16 @@ iptables -I FORWARD 1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH
 ```
 
 **机制说明：**
-- 放行：已建立连接（ESTABLISHED,RELATED）、SSH(`$SSH_PORT`)、DNS(`$DNS_SERVERS`)、ICMP(ping)、loopback。
+- 放行：已建立连接（ESTABLISHED,RELATED）、SSH(`$SSH_PORT` 入/出双向)、DNS(`$DNS_SERVERS`)、ICMP(ping)、loopback。
 - 其余未放行的出入站及转发流量，在 `TRAFFIC_BLOCKED` 链内被兜底 `DROP` 拦截 → 达到"全局封锁、仅留 SSH/DNS"效果。
 - 因为跳转插在**最顶部**且链内兜底 DROP 是终结动作，其他程序（如程序 a）的 ACCEPT 规则会被本轮封网**覆盖**（但**未被删除**）。
 - 默认策略（`-P`）、其他链的内容、其他程序规则全部保持不变。
 - 封网规则带明显注释 `TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)`，一眼可识别是程序封网。
+
+> **NAT 机 / 端口映射场景（Oracle、云 NAT、跳板等）**：`SSH_PORT` 一律填 **VPS 内部 sshd 实际监听的端口**，与外部连接端口无关。
+> 例：外部 `ssh -p 30999 root@vps` 实际是某 NAT 把 `30999 → VPS 内部 22`，此时 `SSH_PORT` 应填 `22`（而不是 `30999`）。
+> 原理：NAT 在 VPS 之外完成地址转换，**VPS 上看到的目标端口始终是 sshd 真实监听的端口**。脚本按该端口放行 INPUT（`--dport`）与 OUTPUT（`--sport`）即可保证封网后 SSH 不断。
+> 反例：填外部端口（如 `30999`）会导致 VPS 内部无进程监听该端口，封网后入站 SSH 请求（目标 `22`）无法命中放行 → 自己锁死。
 
 **恢复时只删除本脚本的三条跳转 + 自家链（解网=移除本脚本封锁，其他程序自然恢复）：**
 ```bash
