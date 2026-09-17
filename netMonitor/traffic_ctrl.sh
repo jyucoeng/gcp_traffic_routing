@@ -402,10 +402,11 @@ fi
 echo "--> 检测到当前主网卡为: $INTERFACE (IPv4=$HAS_V4 IPv6=$HAS_V6)"
 
 # 2. 安装依赖工具 (curl/openssl 恒装：改配置启用 TG 后无需重装依赖)
+#    流量统计由 netstat.sh 直接读 /proc/net/dev 完成，不再需要 vnstat/vnstatd。
 echo "--> 正在更新软件源并安装工具..."
 if [ "$OS" = "alpine" ]; then
     apk update
-    # 确保 community 仓库已启用 (vnstat/iptables 等位于 community；部分精简镜像仅开 main)
+    # 确保 community 仓库已启用 (iptables 等位于 community；部分精简镜像仅开 main)
     if ! grep -qE '^[^#]*/community[[:space:]]*$' /etc/apk/repositories 2>/dev/null; then
         if grep -qE '^[^#]*/main[[:space:]]*$' /etc/apk/repositories 2>/dev/null; then
             grep -E '^[^#]*/main[[:space:]]*$' /etc/apk/repositories \
@@ -415,37 +416,36 @@ if [ "$OS" = "alpine" ]; then
         fi
     fi
     # bash: 主脚本及生成的子脚本均为 bash 语法；iproute2: busybox ip 功能不全
-    # vnstat-openrc: Alpine vnstat 的 OpenRC 服务脚本独立子包 (服务名 vnstatd)
-    apk add --no-cache vnstat vnstat-openrc bc curl openssl iptables iptables-openrc \
+    apk add --no-cache bc curl openssl iptables iptables-openrc \
         ip6tables ip6tables-openrc tzdata bash iproute2 \
         || { echo "--> apk 安装失败，重试一次 (启用 community 后重新更新源)..."; \
-             apk update && apk add --no-cache vnstat vnstat-openrc bc curl openssl \
+             apk update && apk add --no-cache bc curl openssl \
                 iptables iptables-openrc ip6tables ip6tables-openrc tzdata bash iproute2; }
     # 逐个校验关键工具是否就绪，缺失则明确报错
     MISSING=""
-    for _t in vnstat iptables ip6tables bc curl openssl bash; do
+    for _t in iptables ip6tables bc curl openssl bash; do
         command -v "$_t" >/dev/null 2>&1 || MISSING="$MISSING $_t"
     done
     if [ -n "$MISSING" ]; then
         echo "错误：以下工具安装失败:$MISSING" >&2
         echo "提示：请检查 /etc/apk/repositories 源可用性，或手动执行:" >&2
-        echo "  apk add --no-cache vnstat vnstat-openrc bc curl openssl iptables iptables-openrc ip6tables ip6tables-openrc tzdata bash iproute2" >&2
+        echo "  apk add --no-cache bc curl openssl iptables iptables-openrc ip6tables ip6tables-openrc tzdata bash iproute2" >&2
         exit 1
     fi
     # alpine 无 systemd，服务管理用 openrc / rc-service
     SVC_MGR=openrc
 else
     apt-get update -y
-    apt-get install vnstat bc curl openssl iptables ip6tables -y \
+    apt-get install bc curl openssl iptables ip6tables -y \
         || apt-get install -f -y
     # 逐个校验关键工具是否就绪，缺失则明确报错
     MISSING=""
-    for _t in vnstat iptables ip6tables bc curl openssl; do
+    for _t in bc curl openssl iptables ip6tables; do
         command -v "$_t" >/dev/null 2>&1 || MISSING="$MISSING $_t"
     done
     if [ -n "$MISSING" ]; then
         echo "错误：以下工具安装失败:$MISSING" >&2
-        echo "提示：请手动执行: apt-get update && apt-get install vnstat bc curl openssl iptables ip6tables" >&2
+        echo "提示：请手动执行: apt-get update && apt-get install bc curl openssl iptables ip6tables" >&2
         exit 1
     fi
     SVC_MGR=systemd
@@ -471,25 +471,102 @@ if is_oracle_platform && [ "$SVC_MGR" = "systemd" ]; then
     # 注意: 不停用也不再清空现有 iptables 规则，避免影响其他程序
 fi
 
-# 3. 配置并启动 vnStat
-echo "--> 配置 vnStat..."
-# 尝试添加接口
-if ! vnstat --add -i "$INTERFACE" 2>/dev/null; then
-    echo "    (接口可能已存在，跳过添加)"
+# 3. 生成独立流量统计脚本 (/root/netstat.sh)
+#    算法与哪吒探针(nezha)一致：直接读 /proc/net/dev，排除虚拟网卡(lo/docker/veth/br-等)，
+#    对剩余全部物理网卡的 TX 求和作为"当前出站累计"；通过与上次快照求差得到增量，
+#    累加到当月累计（快照回绕/服务器重启时增量归零重新累计），彻底摆脱对 vnstatd 的依赖。
+#    供下方 heredoc 展开的绝对路径（check/reset 内 get_monthly_tx 调用统一用此变量）
+NETSTAT_BIN="/root/netstat.sh"
+echo "--> 生成独立流量统计脚本 /root/netstat.sh..."
+cat > /root/netstat.sh <<'NETSTAT'
+#!/bin/bash
+# netstat.sh - 独立出站流量统计 (nezha 式 /proc/net/dev + 月度增量)
+# 用法:
+#   /root/netstat.sh            输出当月累计出站字节 (纯数字)
+#   /root/netstat.sh --reset    清零当月累计 (每月1号由 reset_network.sh 调用)
+#   /root/netstat.sh --current  输出当前网卡累计快照 (调试用)
+#   两种用法均会更新/持久化快照。状态文件: /var/lib/traffic_monitor/netcount
+
+set -u
+STATE_DIR="/var/lib/traffic_monitor"
+COUNT_FILE="$STATE_DIR/netcount"
+CUR_MONTH=$(date '+%Y-%m')
+
+# 排除的虚拟网卡标识 (与 nezha 过滤规则对齐)
+is_virtual() {
+    local n="$1"
+    case "$n" in
+        lo|docker*|veth*|br-*|virbr*|tun*|tap*|vbox*|dummy*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 读 /proc/net/dev, 对所有"非虚拟"网卡的 TX (第 10 列) 求和
+current_tx() {
+    awk '
+        /^[[:space:]]*[a-zA-Z0-9_@.-]+:/ {
+            iface=$1; sub(/:/,"",iface)
+            if (iface=="lo" || iface ~ /^docker/ || iface ~ /^veth/ || iface ~ /^br-/ \
+                || iface ~ /^virbr/ || iface ~ /^tun/ || iface ~ /^tap/ || iface ~ /^vbox/ \
+                || iface ~ /^dummy/) next
+            sum += $10
+        }
+        END { print sum+0 }
+    ' /proc/net/dev
+}
+
+mkdir -p "$STATE_DIR"
+CUR=$(current_tx)
+
+if [ "${1:-}" = "--current" ]; then
+    echo "$CUR"
+    exit 0
 fi
 
-if [ "$SVC_MGR" = "openrc" ]; then
-    # Alpine 提供独立的 vnstat-openrc 服务脚本，服务名固定为 vnstatd
-    rc-service vnstatd start 2>/dev/null || true
-    rc-update add vnstatd default 2>/dev/null || true
+# 读取上次状态
+LAST=0; MONTH_TX=0; MONTH=""
+[ -f "$COUNT_FILE" ] && . "$COUNT_FILE"
+
+# 跨月: 清零当月累计 (新计费周期), 快照保留为下次 delta 基准
+if [ "$MONTH" != "$CUR_MONTH" ]; then
+    MONTH_TX=0
+    MONTH="$CUR_MONTH"
+fi
+
+if [ "${1:-}" = "--reset" ]; then
+    MONTH_TX=0
+    MONTH="$CUR_MONTH"
+    LAST=$CUR
+    cat > "$COUNT_FILE" <<EOF
+MONTH=$MONTH
+MONTH_TX=$MONTH_TX
+LAST=$LAST
+EOF
+    echo "$MONTH_TX"
+    exit 0
+fi
+
+# 求增量: 快照回绕(重启)时 delta 归零重计, 与 nezha min() 语义一致
+if [ "$LAST" -eq 0 ] || [ "$CUR" -lt "$LAST" ]; then
+    DELTA=$CUR
 else
-    systemctl enable vnstat
-    systemctl restart vnstat
+    DELTA=$(( CUR - LAST ))
 fi
+MONTH_TX=$(( MONTH_TX + DELTA ))
+LAST=$CUR
 
-# 等待服务启动并生成初始数据库
-sleep 5
-vnstat -i "$INTERFACE" > /dev/null 2>&1
+cat > "$COUNT_FILE" <<EOF
+MONTH=$MONTH
+MONTH_TX=$MONTH_TX
+LAST=$LAST
+EOF
+
+echo "$MONTH_TX"
+NETSTAT
+chmod +x /root/netstat.sh
+# 立即初始化快照 (--reset：当月累计=0、快照=当前累计；此后每5分钟增量累计)
+/root/netstat.sh --reset >/dev/null 2>&1 || true
+echo "--> 流量统计脚本已生成并初始化 (独立于 vnstat)。"
 
 # 3.5 生成运行时配置文件与密钥
 gen_key
@@ -664,11 +741,14 @@ tg_send() {
 
 # ==========================================
 # 获取当月累计出站流量 (返回原始字节数)
+# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量)
+# 注意: 调用 netstat.sh 本身就是一次"采样"(其内部会推进快照计算增量),
+#       必须只调用一次并把结果复用, 避免同一 cron 周期多次采样导致累计翻倍。
 # ==========================================
+NETSTAT_BIN="/root/netstat.sh"
 get_monthly_tx() {
-    # vnstat 月度数据 TX (单位字节，取当月)
     local month_tx
-    month_tx=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null | cut -d ';' -f 10)
+    month_tx=\$("$NETSTAT_BIN" 2>/dev/null)
     if [ -z "\$month_tx" ] || ! [[ "\$month_tx" =~ ^[0-9]+$ ]]; then
         month_tx=0
     fi
@@ -717,14 +797,12 @@ get_cpu_type() {
 }
 
 # ==========================================
-# 获取流量数据 (强制使用 'b' 参数获取字节单位)
+# 获取当月累计出站流量 (字节)
+# 由独立统计脚本 netstat.sh 计算 (nezha 式 /proc/net/dev + 月度增量)
 # ==========================================
-VNSTAT_RAW=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null)
+TX_BYTES=\$("$NETSTAT_BIN" 2>/dev/null)
 
-# 提取出站流量 (TX)，第 10 个字段
-TX_BYTES=\$(echo "\$VNSTAT_RAW" | cut -d ';' -f 10)
-
-# 如果获取失败或为空，默认为 0 (vnstat 无数据时会输出 "No data" 提示而非数字, 同样归 0)
+# 如果获取失败或为空，默认为 0 (netstat.sh 正常输出纯数字; 任何异常归 0)
 if [[ -z "\$TX_BYTES" ]] || ! [[ "\$TX_BYTES" =~ ^[0-9]+$ ]]; then
     TX_BYTES=0
 fi
@@ -998,9 +1076,11 @@ get_ip_and_loc() {
 }
 
 # 获取当月累计出站流量 (返回原始字节数)
+# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量)
+# 注意: 必须在 reset 前调用一次 (采样当月最终值), reset 会清零计数。
 get_monthly_tx() {
     local month_tx
-    month_tx=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null | cut -d ';' -f 10)
+    month_tx=\$("/root/netstat.sh" 2>/dev/null)
     if [ -z "\$month_tx" ] || ! [[ "\$month_tx" =~ ^[0-9]+$ ]]; then
         month_tx=0
     fi
@@ -1082,30 +1162,14 @@ unblock_fw() {
 [ "\$HAS_V6" = "1" ] && unblock_fw ip6tables
 log "已移除本脚本的封网规则 (TRAFFIC_BLOCKED)，网络恢复。"
 
-# 3. 重置 vnStat 数据库 (Debian/Ubuntu 用 systemd，Alpine 用 OpenRC，服务名 vnstatd)
-#    在重置前先采样"上个月"最终出站流量 (重置后数据库清零，用于恢复通知展示)
+# 3. 重置流量统计 (nezha 式 netstat.sh 清零当月累计)
+#    在重置前先采样"上个月"最终出站流量 (reset 后计数清零，用于恢复通知展示)
 LAST_MONTH_TX=\$(get_monthly_tx)
 if [ -n "\$LAST_MONTH_TX" ] && [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null; then
     log "上个月出站流量: \$(format_traffic "\$LAST_MONTH_TX") (\$LAST_MONTH_TX Bytes)"
 fi
-if command -v rc-service >/dev/null 2>&1; then
-    rc-service vnstatd stop 2>/dev/null || true
-else
-    systemctl stop vnstat
-fi
-vnstat --remove --force -i "\$INTERFACE"
-vnstat --add -i "\$INTERFACE"
-if command -v rc-service >/dev/null 2>&1; then
-    rc-service vnstatd start 2>/dev/null || true
-else
-    systemctl start vnstat
-fi
-
-# 强制刷新一次数据以确保数据库建立
-sleep 3
-vnstat -i "\$INTERFACE" > /dev/null 2>&1
-
-log "vnStat 数据库已重置 (接口: \$INTERFACE)。"
+/root/netstat.sh --reset >/dev/null 2>&1 || true
+log "流量统计已重置 (netstat.sh 当月累计清零)。"
 
 # 4. 网络恢复后发送 TG 通知 (仅当 TG 启用且上月处于断网状态时发送一次)
 #    在防火墙已全部放开之后发送 (此时网络可用，能获取 IP)

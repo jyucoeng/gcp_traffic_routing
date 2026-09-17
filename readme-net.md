@@ -6,7 +6,7 @@
 
 **完整支持纯 IPv4 / 纯 IPv6 / 双栈 VPS**：部署时自动探测地址族（`HAS_V4`/`HAS_V6`），封网与解网时按地址族分别操作 `iptables`(IPv4) 与 `ip6tables`(IPv6)；DNS 服务器按 IP 类型自动分流到对应表；纯 IPv6 机自动选用 IPv6 DNS 默认值。
 
-**支持 Debian / Ubuntu / Alpine 三种系统**：`apt-get`+systemd、`apk`+OpenRC 自动识别，含 `iptables`/`ip6tables`、vnStat、crontab/crond 一应俱全。
+**支持 Debian / Ubuntu / Alpine 三种系统**：`apt-get`+systemd、`apk`+OpenRC 自动识别，含 `iptables`/`ip6tables`、crontab/crond 一应俱全。流量统计由内置的 nezha 式脚本（读 `/proc/net/dev`）完成，**无 vnstat/守护进程依赖**。
 
 ---
 
@@ -139,8 +139,8 @@ PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root
 部署过程会：
 0. 自动识别发行版（`debian`/`ubuntu`/`alpine`），分别用 apt 或 apk 装依赖
 1. 自动探测默认网卡与地址族（先 IPv4 默认路由，失败回退 IPv6）
-2. 安装依赖：`vnstat`、`bc`、`curl`、`openssl`、`iptables`、`ip6tables`（aes 加密解密需要；恒装，后续启用 TG 无需重装依赖）
-3. 初始化并启动 vnStat 数据库
+2. 安装依赖：`bc`、`curl`、`openssl`、`iptables`、`ip6tables`（aes 加密解密需要；恒装，后续启用 TG 无需重装依赖）
+3. 生成独立流量统计脚本 `/root/netstat.sh`（nezha 式：直接读 `/proc/net/dev`，排除虚拟网卡做月度出站增量统计，不依赖 vnstat/守护进程）
 4. 生成两个运行时脚本并写入 `/root/`：
    - `/root/check_traffic.sh` — 流量检查 & 封网
    - `/root/reset_network.sh` — 每月重置
@@ -153,6 +153,17 @@ PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root
 | 每月 **1 号 00:00** (`0 0 1 * *`) | `/root/reset_network.sh` | 每月重置流量/日志并解除封网 |
 
 > 即 `check_traffic.sh` 每 5 分钟执行一次；`reset_network.sh` 每月 1 号零点执行一次。如需调整频率，改部署脚本里对应的 crontab 行后重新部署。
+
+### 3.5 流量统计原理（nezha 式，无守护进程）
+出站流量由独立脚本 `/root/netstat.sh` 统计，算法与哪吒探针（nezha）一致：
+1. 直接读 `/proc/net/dev`，**排除虚拟网卡**（lo / docker* / veth* / br-* / virbr* / tun* / tap* / vbox* / dummy*），对其余全部物理网卡的 **TX（出站字节，第 10 列）求和**作为当前网卡累计值。
+2. 通过「当前累计 − 上次快照」得到增量，累加到**当月累计**并持久化到 `/var/lib/traffic_monitor/netcount`。
+3. 快照回绕检测：若当前累计 < 上次快照（服务器重启、计数器归零），则增量按「从 0 重新累计」，语义与 nezha 的 `min()` 防回绕一致，**重启不丢流量、不产生离谱负值**。
+4. 跨月自动清零当月累计（新计费周期）；每月 1 号 `reset_network.sh` 额外执行 `netstat.sh --reset` 显式初始化。
+
+因此统计**只关心网卡层出站总量，不区分进程/IP**（与 nezha 一致），且不依赖 vnstat/任何守护进程。
+
+> 为什么换掉 vnstat：vnstat 依赖独立守护进程 + SQLite 数据库，数据库重建/服务重启时会出现采样停滞、"No data"、计数错乱等问题；nezha 式直读 `/proc/net/dev` 逻辑更简单、故障面更小，且与主流监控工具口径一致。
 
 ### 4. 封网策略（全局封锁，仅影响本脚本，不干扰其他程序）
 超限后，本脚本**只操作自己创建的 `TRAFFIC_BLOCKED` 链**，不改全局默认策略、不全局清空，**不影响其他程序已有的防火墙规则**。封网范围覆盖 **INPUT / OUTPUT / FORWARD 三条链**，实现真正全局封锁（**含转发至其他 VPS 的中转流量**，同样被 FORWARD 拦截）。**根据探测到的地址族**，IPv4 用 `iptables`、IPv6 用 `ip6tables`（含 `ip6tables` 专用的 `ipv6-icmp` 放行、IPv6 DNS 分流），双栈机两者同时生效。
@@ -302,7 +313,7 @@ iptables -X TRAFFIC_BLOCKED
 |------|------|
 | `/root/traffic_ctrl.sh` | 部署脚本本地副本（封网后断外网仍可运行 edit / set-tg 或重新部署） |
 | `/root/check_traffic.sh` | 运行时监控脚本（每 5 分钟 cron 执行：查流量、超限封网、TG 通知） |
-| `/root/reset_network.sh` | 运行时重置脚本（每月 1 号 cron 执行：删日志、清封网规则、重置 vnStat、TG 通知） |
+| `/root/reset_network.sh` | 运行时重置脚本（每月 1 号 cron 执行：删日志、清封网规则、重置 netstat 统计、TG 通知） |
 | `/etc/netMonitor.conf` | 运行时配置（0600，DNS/LIMIT/SSH_PORT/网卡/加密凭据；改配置请用子命令，勿手改） |
 | `/etc/netMonitor.key` | TG 凭据 AES-256 加密密钥文件（0600，仅 root 可读；**丢失后凭据不可恢复**，需重新 `set-tg`） |
 | `/var/log/traffic_monitor.log` | 监控日志 |
