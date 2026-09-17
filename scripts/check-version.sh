@@ -50,7 +50,8 @@ if bash -n "${ROOT_DIR}/cdn.sh" && bash -n "${ROOT_DIR}/install.sh" \
   && bash -n "${ROOT_DIR}/scripts/build-release-bundle.sh" \
   && bash -n "${ROOT_DIR}/scripts/check-version.sh" \
   && bash -n "${ROOT_DIR}/tests/smoke.sh" \
-  && bash -n "${ROOT_DIR}/tests/test-install.sh"; then
+  && bash -n "${ROOT_DIR}/tests/test-install.sh" \
+  && bash -n "${ROOT_DIR}/netMonitor/traffic_ctrl.sh"; then
   ok "全部脚本 bash -n 通过"
 else
   bad "存在脚本语法错误（bash -n）"

@@ -1,0 +1,303 @@
+# netMonitor — 流量监控自动部署脚本
+
+针对 **gcp / Oracle Cloud** 的 Linux 实例的流量监控与自动止损脚本。
+通过监控网卡出站流量 (TX)，超限后**全局封锁**（INPUT + OUTPUT + FORWARD 三条链跳转至自定义链，链内仅放行 SSH / DNS / lo），并可选通过 TG 通知状态变化。
+也支持其他指定平台（如 aws / azure / hetzner），仅需手动指定上限，见「二、可配置项」。
+
+**完整支持纯 IPv4 / 纯 IPv6 / 双栈 VPS**：部署时自动探测地址族（`HAS_V4`/`HAS_V6`），封网与解网时按地址族分别操作 `iptables`(IPv4) 与 `ip6tables`(IPv6)；DNS 服务器按 IP 类型自动分流到对应表；纯 IPv6 机自动选用 IPv6 DNS 默认值。
+
+**支持 Debian / Ubuntu / Alpine 三种系统**：`apt-get`+systemd、`apk`+OpenRC 自动识别，含 `iptables`/`ip6tables`、vnStat、crontab/crond 一应俱全。
+
+---
+
+## 一、脚本用途
+
+单文件 `traffic_ctrl.sh`，TG 通知为**可选功能**，是否启用由部署时传入的环境变量决定：
+
+| 部署方式 | 行为 |
+|------|------|
+| `bash /root/traffic_ctrl.sh` | 纯封网版：超限封网 + 每月自动重置，不发任何通知 |
+| `TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh` | 同上，并额外在**断网时 / 网络恢复时**发送 Telegram 通知 |
+
+两个 `TELEGRAM_*` 环境变量**均非空**才启用通知；任一为空即纯封网版。
+`PLATFORM` 为小写标识（内置特殊处理 gcp/oracle，其他任意平台可用），用 `PLATFORM` 区分，无需维护多套文件。
+
+> **改配置统一通过子命令，勿手改配置文件。** 部署时全部参数固化到 **`/etc/netMonitor.conf`**（权限 0600）。
+> 之后调上限/端口/网卡/TG，运行 **`bash /root/traffic_ctrl.sh edit`**（交互式菜单），改完自动加密落盘并即时生效（无需重新部署）。
+> **⚠️ TG 凭据不明文落盘**：`TELEGRAM_BOT_TOKEN_ENC` / `TELEGRAM_CHAT_ID_ENC` 为 AES-256 加密密文（密钥存 `/etc/netMonitor.key`，权限 0600）。换凭据请用子命令 `set-tg`，不要手改密文。
+
+> **部署脚本建议下载到 VPS 本地保存**：封网后 VPS 断外网，但本地 `traffic_ctrl.sh` 仍可直接运行——可随时 `edit` 调配置、`set-tg` 换凭据、甚至**重新部署**（不依赖网络）。
+
+---
+
+## 二、可配置项（均为环境变量，未设置时取默认值）
+
+| 环境变量 | 说明 | 默认 |
+|------|------|------|
+| `PLATFORM` | 平台标识，**建议统一小写**。内置特殊处理 `gcp`/`oracle`；其他任意标识（如 `aws`/`azure`/`hetzner`/`custom`）也可用，仅需手动指定 `LIMIT` | `gcp` |
+| `LIMIT` | 出站流量上限（GB），超限触发封网。留空则按平台自动 | gcp=`180`，oracle=`9216`(9TB) |
+| `SSH_PORT` | 封网后仅放行的 SSH 管理端口 | `22` |
+| `DNS_SERVERS` | 封网后允许的 DNS 服务器，支持 IPv4/IPv6 混列；留空则按地址族自动选 | IPv4：`8.8.8.8 8.8.4.4`；纯 IPv6：`2001:4860:4860::8888 2001:4860:4860::8844` |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot 的 token（`@BotFather` 创建） | 空（不启用通知） |
+| `TELEGRAM_CHAT_ID` | 接收通知的 chat id | 空（不启用通知） |
+
+```bash
+# 1. 先下载部署脚本到本地保存（封网后断外网也能运行）
+wget -O /root/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh
+chmod +x /root/traffic_ctrl.sh
+
+# 2. 纯封网版-没有tg通知（gcp 默认 180GB，这里显式指定）
+PLATFORM=gcp LIMIT=180 bash /root/traffic_ctrl.sh
+
+# 纯封网版，部署到 oracle，上限 500GB，SSH 端口 2222
+PLATFORM=oracle LIMIT=500 SSH_PORT=2222 bash /root/traffic_ctrl.sh
+
+# 自定义平台示例：aws，手动指定上限 1024GB
+PLATFORM=aws LIMIT=1024 bash /root/traffic_ctrl.sh
+
+# TG 通知版，部署到 oracle（启用断网/恢复的tg通知）
+PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh
+```
+
+> 若 GitHub 无法访问，也可先用 `curl -O https://raw.githubusercontent.com/...` 下载。
+
+`LIMIT` 自动取值逻辑：
+
+```
+PLATFORM=gcp    -> LIMIT=180    (不做强制，支持手动覆盖)
+PLATFORM=oracle -> LIMIT=9216   (9TB，贴近免费层约10TB额度)
+其他平台         -> 未设置时默认 180；强烈建议手动指定 LIMIT
+```
+
+> 若想手动指定一个固定上限，直接设 `LIMIT` 即可（如 `LIMIT=500`）。
+
+### TG 通知版注意事项
+
+- 部署后改配置**统一通过子命令**，勿手改配置文件：`bash /root/traffic_ctrl.sh edit`（交互式菜单）。
+- **换 TG 凭据**：`TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh set-tg`（AES-256 重新加密落盘，不影响其他配置）。
+- **停用 TG**：`bash /root/traffic_ctrl.sh clear-tg`。
+- **查看当前配置**：`bash /root/traffic_ctrl.sh config`（密钥解密后以掩码显示，中间一半用 `*` 遮蔽）。
+- **掩码算法**：`*` 数量 = 字符总数 / 2，首尾各保留剩余一半（即只暴露一半），过短(≤4位)则全隐藏。
+- 未传 TG 环境变量仍会正常部署纯封网版（终端仅提示一次"通知未启用"）。
+
+### oracle 平台额外行为（为什么需要停用 firewalld / ufw）
+
+**ufw / firewalld 与 iptables 的关系：**
+`ufw`（Ubuntu）和 `firewalld`（RHEL 系）是 iptables 的**前端管理工具**，不是替代品。它们最终都是操作 iptables/nftables 来管理防火墙规则。如果同时让它们和脚本直接操作 iptables，**规则会互相冲突覆盖**，导致封网失效。
+
+本脚本的封网机制（自定义链 + 顶部跳转 + comment 精确删除）是 ufw/firewalld **无法表达的精细操作**，所以必须**直接操作 iptables**。为了让直接操作的 iptables 规则稳定生效，必须先停掉 ufw/firewalld，保证没有其他前端在接管 iptables。
+
+**Oracle 实例的处理流程：**
+```
+Oracle 实例启动
+    ↓
+ufw / firewalld 默认开启（会接管/覆盖 iptables 规则）
+    ↓
+脚本先停掉它们（ufw disable / systemctl stop firewalld）→  使 iptables 处于干净状态
+    ↓
+脚本直接操作 iptables（封网/放行/解网）
+```
+- **部署时**：自动停用并禁用 firewalld / ufw。
+- **每次 `check_traffic.sh` 运行时**：兜底检测一次，若发现被重新启用则再次停用（仅 `PLATFORM=oracle` 执行，gcp 跳过）。
+
+仅停用，不做任何全局清空，不影响其他程序。gcp 默认镜像无这两个组件，不需要处理。
+
+---
+
+`PLATFORM` 对 TG 通知标题的影响：
+
+| 特性 | `gcp` | `oracle` |
+|------|-------|----------|
+| 标题 | `🎮 gcp 流量报告` | `🎮 oracle 流量报告` |
+| CPU 行 | 无 | `🌐 CPU: AMD/ARM` |
+| 上限默认 | 180GB | 9TB(9216GB) |
+
+---
+
+## 三、部署与使用
+
+### 1. 前置准备
+- 以 **root** 身份执行（脚本开头会检查）。
+- 用环境变量指定 `PLATFORM`；需要通知时再传 `TELEGRAM_BOT_TOKEN`、`TELEGRAM_CHAT_ID`。
+
+### 2. 下载并执行部署
+```bash
+# 下载部署脚本到本地（建议永久保存，封网后可离线运行）
+wget -O /root/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh
+chmod +x /root/traffic_ctrl.sh
+
+# 基础版，目标为 gcp（显式指定上限 180GB）
+PLATFORM=gcp LIMIT=180 bash /root/traffic_ctrl.sh
+
+# 基础版，目标为 Oracle，上限 500GB
+PLATFORM=oracle LIMIT=500 bash /root/traffic_ctrl.sh
+
+# TG 通知版，目标为 Oracle（环境变量传入平台、上限与 TG 凭据）
+PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh
+```
+
+部署过程会：
+0. 自动识别发行版（`debian`/`ubuntu`/`alpine`），分别用 apt 或 apk 装依赖
+1. 自动探测默认网卡与地址族（先 IPv4 默认路由，失败回退 IPv6）
+2. 安装依赖：`vnstat`、`bc`、`curl`、`openssl`、`iptables`、`ip6tables`（aes 加密解密需要；恒装，后续启用 TG 无需重装依赖）
+3. 初始化并启动 vnStat 数据库
+4. 生成两个运行时脚本并写入 `/root/`：
+   - `/root/check_traffic.sh` — 流量检查 & 封网
+   - `/root/reset_network.sh` — 每月重置
+5. 配置 crontab / crond（自动去重）
+
+### 3. 生成的定时任务（crontab）
+| 计划 | 命令 | 说明 |
+|------|------|------|
+| 每 **5 分钟** (`*/5 * * * *`) | `/root/check_traffic.sh` | 定时读取流量，超限即封网 |
+| 每月 **1 号 00:00** (`0 0 1 * *`) | `/root/reset_network.sh` | 每月重置流量/日志并解除封网 |
+
+> 即 `check_traffic.sh` 每 5 分钟执行一次；`reset_network.sh` 每月 1 号零点执行一次。如需调整频率，改部署脚本里对应的 crontab 行后重新部署。
+
+### 4. 封网策略（全局封锁，仅影响本脚本，不干扰其他程序）
+超限后，本脚本**只操作自己创建的 `TRAFFIC_BLOCKED` 链**，不改全局默认策略、不全局清空，**不影响其他程序已有的防火墙规则**。封网范围覆盖 **INPUT / OUTPUT / FORWARD 三条链**，实现真正全局封锁。**根据探测到的地址族**，IPv4 用 `iptables`、IPv6 用 `ip6tables`（含 `ip6tables` 专用的 `ipv6-icmp` 放行、IPv6 DNS 分流），双栈机两者同时生效。
+
+封网时执行（以 IPv4 为例，IPv6 用 `ip6tables` 对应执行）：
+```bash
+# 创建/复用自家链 TRAFFIC_BLOCKED
+iptables -N TRAFFIC_BLOCKED 2>/dev/null || iptables -F TRAFFIC_BLOCKED
+# 链内放行：已建立连接、SSH、DNS、ICMP、loopback
+iptables -A TRAFFIC_BLOCKED -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A TRAFFIC_BLOCKED -p tcp --dport $SSH_PORT -j ACCEPT
+iptables -A TRAFFIC_BLOCKED -p udp --dport 53 -d <DNS> -j ACCEPT   # 各 DNS 服务器(按地址族分别加入 iptables/ip6tables)
+iptables -A TRAFFIC_BLOCKED -p icmp -j ACCEPT                      # IPv6 用: -p ipv6-icmp
+iptables -A TRAFFIC_BLOCKED -i lo -j ACCEPT
+# 链内兜底 DROP：未放行的流量在本链终结，不回到主链
+iptables -A TRAFFIC_BLOCKED -j DROP
+
+# 在三条主链最顶部各插入一条跳转规则（-I 1），实现全局封锁
+iptables -I INPUT   1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -I OUTPUT  1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -I FORWARD 1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+```
+
+**机制说明：**
+- 放行：已建立连接（ESTABLISHED,RELATED）、SSH(`$SSH_PORT`)、DNS(`$DNS_SERVERS`)、ICMP(ping)、loopback。
+- 其余未放行的出入站及转发流量，在 `TRAFFIC_BLOCKED` 链内被兜底 `DROP` 拦截 → 达到"全局封锁、仅留 SSH/DNS"效果。
+- 因为跳转插在**最顶部**且链内兜底 DROP 是终结动作，其他程序（如程序 a）的 ACCEPT 规则会被本轮封网**覆盖**（但**未被删除**）。
+- 默认策略（`-P`）、其他链的内容、其他程序规则全部保持不变。
+- 封网规则带明显注释 `TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)`，一眼可识别是程序封网。
+
+**恢复时只删除本脚本的三条跳转 + 自家链（解网=移除本脚本封锁，其他程序自然恢复）：**
+```bash
+iptables -D INPUT    -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -D OUTPUT   -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -D FORWARD  -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -F TRAFFIC_BLOCKED 2>/dev/null
+iptables -X TRAFFIC_BLOCKED 2>/dev/null
+```
+删除后，其他程序的规则（如程序 a）**自然恢复生效**，无需任何额外处理。
+
+### 5. 手动查看流量
+```bash
+bash /root/check_traffic.sh
+```
+终端会显示精确出站字节数/GB；详情日志在 `/var/log/traffic_monitor.log`。
+
+### 6. 运行时配置文件 (`/etc/netMonitor.conf`)
+部署时生成，权限 `0600`，各字段（仅作展示，**改配置请用子命令，勿手改**）：
+```
+PLATFORM="oracle"                       # 平台（小写）
+LIMIT=500                               # 链路上限 GB
+SSH_PORT=2222                           # SSH 管理端口
+DNS_SERVERS="8.8.8.8 8.8.4.4"           # 放行的 DNS
+TELEGRAM_BOT_TOKEN_ENC="U2FsdGVkX1..."  # AES-256 密文（勿手改，用 set-tg）
+TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-tg）
+INTERFACE="ens4"                        # 监控网卡
+```
+- 修改任何配置统一用 `bash /root/traffic_ctrl.sh edit`（交互式菜单），改完自动加密落盘、即时生效；
+- 换 TG 凭据也可用 `set-tg`（会重新加密），停用用 `clear-tg`，查看用 `config`（掩码显示）；
+- 密钥文件 `/etc/netMonitor.key`（0600）丢失后密文**不可恢复**，需重新 `set-tg`。
+
+### 7. 子命令一览
+| 子命令 | 作用 |
+|------|------|
+| `edit` | 交互式菜单修改平台/上限/端口/DNS/网卡/TG（推荐） |
+| `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
+| `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash /root/traffic_ctrl.sh set-tg`） |
+| `clear-tg` | 停用通知并清除凭据 |
+
+---
+
+## 四、TG 通知与状态机制（启用 TG 时）
+
+> **核心规则：** 整个通知机制按**每月周期**运作。每个计费月内，断网通知和恢复通知各**最多发送一次**。
+
+### 通知时机
+| 时机 | 标题 | 触发条件 | 频率 |
+|------|------|---------|------|
+| 超限断网前 | `🎮 {PLATFORM} 流量报告（断网通知）` | 当月首次流量 ≥ LIMIT，封网前发送 | 当月首次超限时发送 **1 次** |
+| 每月 1 号恢复 | `🎮 {PLATFORM} 流量报告（网络恢复通知）` | 当月曾处于断网状态，reset 恢复后发送 | 每月 1 号最多发送 **1 次** |
+
+### 通知内容（模板）
+```
+🎮 oracle 流量报告（断网通知）
+
+🌐 本机IP: 152.69.***.146 (Osaka-JP)
+🕐 运行时间: 2026-09-04 10:20:33
+📚 网络状态: 正常 ---> 断网
+🌐 本月流量: 123.45GB / 上限: 9216 GB
+🌐 CPU: AMD        ← 仅 oracle 显示
+```
+- **本机IP**：自动获取公网 IPv4 并打码（`a.b.***.d`），国家/城市取 `ip-api.com`（重试 3 次，失败降级仅显示国家 → `unknown`）
+- **本月流量**：按层级自动换算 `MB → GB → TB`（<1GB 用 MB；<1024GB 用 GB；≥1024GB 用 TB）
+- **运行时间**：服务器当前时间
+- **CPU**（仅 oracle）：`aarch64`→ARM；型号含 `AMD`/`EPYC`→AMD
+
+### 状态文件（保证"同一事件周期只发一次"）
+状态记录在 `/var/lib/traffic_monitor/state`：
+```
+MONTH=2026-09      # 当前跟踪月份
+STATE=normal       # normal / blocked
+BLOCKED_TIME=      # 本月断网时刻
+BLOCKED_TX=        # 断网时已用流量(字节)
+RESTORED_TIME=     # 恢复时刻
+```
+- 同一断网周期内（STATE 已为 `blocked`），重复运行 check 时**不再发断网通知**，避免刷屏。
+- 每月 reset 恢复后，若上月确实断过网且 TG 已启用，才发恢复通知，并进入新月份周期。
+
+---
+
+## 五、封网后如何手动解锁 / 恢复
+
+每月 1 号 `reset_network.sh` 会自动恢复。
+如需手动立即解锁（只删本脚本的规则，不影响其他程序）。下面以 IPv4 为例，**纯 IPv6 机把 `iptables` 换成 `ip6tables` 执行；双栈机两者都执行**：
+```bash
+iptables -D INPUT    -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -D OUTPUT   -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -D FORWARD  -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+iptables -D INPUT    -j TRAFFIC_BLOCKED 2>/dev/null
+iptables -D OUTPUT   -j TRAFFIC_BLOCKED 2>/dev/null
+iptables -D FORWARD  -j TRAFFIC_BLOCKED 2>/dev/null
+iptables -F TRAFFIC_BLOCKED
+iptables -X TRAFFIC_BLOCKED
+```
+
+---
+
+## 六、文件清单与说明
+
+### 仓库内文件
+
+| 文件 | 说明 |
+|------|------|
+| `netMonitor/traffic_ctrl.sh` | 单文件部署脚本（纯封网版 / TG 通知版由部署时传入的环境变量决定） |
+| `readme-net.md` | 本文档 |
+
+### 部署后生成的文件（VPS 上）
+
+| 文件 | 说明 |
+|------|------|
+| `/root/traffic_ctrl.sh` | 部署脚本本地副本（封网后断外网仍可运行 edit / set-tg 或重新部署） |
+| `/root/check_traffic.sh` | 运行时监控脚本（每 5 分钟 cron 执行：查流量、超限封网、TG 通知） |
+| `/root/reset_network.sh` | 运行时重置脚本（每月 1 号 cron 执行：删日志、清封网规则、重置 vnStat、TG 通知） |
+| `/etc/netMonitor.conf` | 运行时配置（0600，DNS/LIMIT/SSH_PORT/网卡/加密凭据；改配置请用子命令，勿手改） |
+| `/etc/netMonitor.key` | TG 凭据 AES-256 加密密钥文件（0600，仅 root 可读；**丢失后凭据不可恢复**，需重新 `set-tg`） |
+| `/var/log/traffic_monitor.log` | 监控日志 |
+| `/var/log/network_reset.log` | 重置日志 |
+| `/var/lib/traffic_monitor/state` | 运行状态（当前月/封网状态/封网计数） |
