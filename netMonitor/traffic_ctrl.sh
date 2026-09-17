@@ -27,9 +27,8 @@
 #   bash traffic_ctrl.sh config     # 查看当前配置（TG 凭据以掩码显示）
 #
 # 平台差异通过 PLATFORM 区分（建议统一小写）：
-#   PLATFORM=gcp    -> 上限默认 180GB
-#   PLATFORM=oracle -> 上限默认 9TB(9216GB)，并自动停用 firewalld/ufw
-#   其他任意标识可用（aws/azure/hetzner/custom...），仅需手动指定 LIMIT：
+# 自动停用 firewalld/ufw
+# 其他任意标识可用（aws/azure/hetzner/custom...），仅需手动指定 LIMIT：
 #     例: PLATFORM=aws LIMIT=1024 bash traffic_ctrl.sh
 # ==========================================
 
@@ -38,14 +37,18 @@
 # ==========================================
 # 平台标识: 建议全部用小写。
 #   内置特殊处理: gcp / oracle
-#     - gcp    -> LIMIT 默认 180
-#     - oracle -> LIMIT 默认 9216，并自动停用 firewalld/ufw
+#     - gcp    -> LIMIT 
+#     - oracle -> LIMIT 并自动停用 firewalld/ufw
 #   其他任意平台标识也可用（如 aws / azure / hetzner / custom...），
 #   仅需手动指定 LIMIT；TG 通知标题会显示对应的平台名。
 PLATFORM="${PLATFORM:-gcp}"
 
+# --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
+# AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
+AUTHOR="${AUTHOR:-littleDoraemon}"
+VERSION="${VERSION:-v0.1.0}"
+
 # 出站流量上限 (GB)，超过该值触发封网
-# 留空时按 PLATFORM 自动设置: gcp=180, oracle=9216；其他平台请务必手动指定
 LIMIT="${LIMIT:-}"
 
 # SSH 端口，超限双向封网后仍双向放行的端口 (INPUT 入站握手 + OUTPUT 回包)，保证远程管理不断线。
@@ -122,6 +125,57 @@ require_root() {
     fi
 }
 
+# ==========================================
+# 卸载函数（del 子命令；覆盖式安装=先卸再装时复用清理）
+# 只清理"本脚本自己在部署期落下的部署物"：
+#   - crontab 里 check_traffic.sh / reset_network.sh 两条调度
+#   - 部署生成的 /root/check_traffic.sh 与 /root/reset_network.sh（两层 heredoc 副本各有一份，都在 /root）
+#   - 运行时配置 /etc/netMonitor.conf 与其 0600 父目录
+#   - 解密的运行密钥 /etc/netMonitor.key（TG 凭据 AES 密钥，丢失后不可恢复）
+#   - 运行时状态 /var/lib/traffic_monitor/ 与 /var/log/netMonitor*.log
+# 不动宿主系统其他 crontab 条目 / iptables 规则 / 默认策略。
+# 幂等：任意步骤缺失即跳过，可重复调用（覆盖式安装 / del 通用）。
+# 提示：外层文件自身还会把 AUTHER/VERSION 常量写进 conf heredoc 落盘，
+#       本函数一并清掉这些副本生成物，保证卸载后不留脚本痕迹。
+uninstall() {
+    # crontab 仅移除本脚本两条调度，保留其他任务
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
+    fi
+    # 移除两层 heredoc 副本生成的部署脚本（都在 /root）
+    rm -f /root/check_traffic.sh /root/reset_network.sh 2>/dev/null || true
+    # 移除运行时配置、密钥、状态、日志
+    rm -rf /etc/netMonitor.conf /etc/netMonitor.key /var/lib/traffic_monitor 2>/dev/null || true
+    rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
+    echo "  -> netMonitor 已卸载，原部署物已清理；可随时重新部署（覆盖式安装会自动先卸再装）。"
+}
+
+# ==================================================
+# 卸载函数（del 子命令 / 覆盖式安装共用）
+# 只清理"本脚本自己的部署物"，不动宿主其他 crontab/iptables 规则；
+# 覆盖式安装 = 部署流程先调用本函数清掉旧物，再重新完整部署。
+# 本函数仅属外层部署器；两份 heredoc 生成的 check/reset 是独立运行时脚本，无需各自的 uninstall。
+# ==================================================
+uninstall() {
+    # 1. 从 crontab 移除本脚本的两条调度（只删含 check_traffic/reset_network 的行，保留其他任务）
+    if command -v crontab >/dev/null 2>&1; then
+        crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
+    fi
+
+    # 2. 删除部署时生成的两份运行时脚本
+    rm -f /root/check_traffic.sh /root/reset_network.sh
+
+    # 3. 删除运行时配置与 TG 密钥（避免残留旧平台/旧凭据）
+    [ -n "${CONF_FILE:-}" ] && rm -f "$CONF_FILE"
+    [ -n "${NETMON_KEY:-}" ] && rm -f "$NETMON_KEY"
+
+    # 4. 删除运行时状态/计数/日志
+    rm -rf /var/lib/traffic_monitor /var/lib/traffic_monitor_archive 2>/dev/null || true
+    rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
+
+    echo "  -> 已卸载（旧部署物已清理；如需重新部署请直接 bash $0 执行覆盖式安装）。"
+}
+
 # 生成密钥文件（首次使用时；已存在则复用）
 gen_key() {
     if [ ! -s "$NETMON_KEY" ]; then
@@ -177,6 +231,9 @@ SSH_PORT=$SSH_PORT
 DNS_SERVERS="$DNS_SERVERS"
 HAS_V4=$HAS_V4
 HAS_V6=$HAS_V6
+# 作者 / 版本（部署期常量，供菜单展示；也随 conf 落盘供运行时/生成脚本读取）
+AUTHOR="$AUTHOR"
+VERSION="$VERSION"
 TELEGRAM_BOT_TOKEN_ENC="$(enc_tg "$TELEGRAM_BOT_TOKEN")"
 TELEGRAM_CHAT_ID_ENC="$(enc_tg "$TELEGRAM_CHAT_ID")"
 INTERFACE="$INTERFACE"
@@ -243,9 +300,10 @@ config_show() {
     c="$(dec_tg "$TELEGRAM_CHAT_ID_ENC")"
 
     echo "======== netMonitor 当前配置 ========"
+    echo " 作者/版本     : ${AUTHOR:-littleDoraemon}  ${VERSION:-v0.1.0}"
     echo "平台         : ${PLATFORM:-gcp}"
     echo "流量上限     : ${LIMIT:-180} GB"
-    echo "流量口径     : ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 sum=总和)"
+    echo "流量口径     : ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
     echo "SSH 端口     : ${SSH_PORT:-22}"
     echo "DNS 服务器   : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
     echo "网卡接口     : ${INTERFACE:-}"
@@ -286,9 +344,10 @@ config_edit() {
     while :; do
         echo ""
         echo "======== netMonitor 配置修改菜单 ========"
+        echo " 作者/版本     : ${AUTHOR:-littleDoraemon}  ${VERSION:-v0.1.0}"
         echo "  平台 PLATFORM    : ${PLATFORM:-gcp}"
         echo "  流量上限 LIMIT   : ${LIMIT:-180} GB"
-        echo "  流量口径 STAT_MODE: ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 sum=总和)"
+        echo "  流量口径 STAT_MODE: ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
         echo "  SSH 端口         : ${SSH_PORT:-22}"
         echo "  DNS 服务器       : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
         echo "  网卡接口         : ${INTERFACE:-}"
@@ -378,6 +437,10 @@ case "${1:-}" in
         ;;
     edit)
         config_edit
+        exit 0
+        ;;
+    del)
+        uninstall
         exit 0
         ;;
 esac
@@ -787,7 +850,7 @@ tg_send() {
 # 注意: netstat.sh 每次调用都会推进快照，必须只调用一次并把结果复用，
 #       否则同一 cron 周期多次采样会导致累计翻倍。
 # 设置: MONTH_TX / MONTH_RX (字节), 并按 STAT_MODE 计算 BAL_BYTES (超限判断口径)
-#   STAT_MODE: out=出站 in=入站 max=取大 sum=总和
+#   STAT_MODE: out=出站 in=入站 max=取大 min=取小 sum=总和
 # ==========================================
 NETSTAT_BIN="/root/netstat.sh"
 read_traffic() {
@@ -864,7 +927,7 @@ echo " 网卡接口    : \$INTERFACE"
 echo " 当前时间    : \$(date '+%Y-%m-%d %H:%M:%S')"
 echo " 上行出站(TX): \$(format_traffic "\$MONTH_TX") (\$MONTH_TX Bytes)"
 echo " 下行入站(RX): \$(format_traffic "\$MONTH_RX") (\$MONTH_RX Bytes)"
-echo " 计费口径    : \$STAT_MODE (out=出站 in=入站 max=取大 sum=总和)"
+echo " 计费口径    : \$STAT_MODE (out=出站 in=入站 max=取大 min=取小 sum=总和)"
 echo " 计费流量    : \$(format_traffic "\$BAL_BYTES") (\$BAL_BYTES Bytes)"
 echo " 流量上限    : \$LIMIT GB"
 echo "========================================"
@@ -1010,6 +1073,8 @@ NETMON_KEY="$NETMON_KEY"
 RESET_LOG="/var/log/network_reset.log"
 TRAFFIC_LOG="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
+# 上个月流量月度档案 (长期留存): 每次月度重置时把上月最终上下行追加一行, 一行一月
+ARCHIVE_FILE="/var/lib/traffic_monitor/archive"
 
 # 读取运行时配置
 if [ -r "\$CONF_FILE" ]; then
@@ -1213,6 +1278,17 @@ log "已移除本脚本的封网规则 (TRAFFIC_BLOCKED)，网络恢复。"
 # 3. 重置流量统计 (nezha 式 netstat.sh 清零当月累计)
 #    在重置前先采样"上个月"最终上下行流量 (reset 后计数清零，用于恢复通知展示)
 read_traffic_last
+# 3.1 归档"上个月"最终上下行到月度档案 (长期留存, 一行一月, 同一月只追加一次)
+#    月份取 netstat.sh 状态文件中的 MONTH (此时尚未 reset, 仍是上月标识, 与本次归档的数值同月)
+ARCH_MONTH="\$(sed -n 's/^MONTH=//p' /var/lib/traffic_monitor/netcount 2>/dev/null | tail -n1)"
+if [ -n "\$ARCH_MONTH" ] && ! grep -q "^[[:space:]]*\$ARCH_MONTH[[:space:]]" "\$ARCHIVE_FILE" 2>/dev/null; then
+    mkdir -p "\$(dirname "\$ARCHIVE_FILE")"
+    # 字段: 月份 TX=上月上流 RX=上月下流 mode=计费口径 blocked=上月是否触发封网(blocked=触发 normal=未触发)
+    printf '%s TX=%s RX=%s mode=%s blocked=%s\n' "\$ARCH_MONTH" "\$LAST_MONTH_TX" "\$LAST_MONTH_RX" "\$STAT_MODE" "\$STATE" >> "\$ARCHIVE_FILE"
+    log "已归档上个月流量到月度档案: \$ARCH_MONTH 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX") (口径 \$STAT_MODE, 封网 \$STATE)"
+else
+    log "上月流量档案已存在或月份无效，跳过归档。"
+fi
 if [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null || [ "\$LAST_MONTH_RX" -gt 0 ] 2>/dev/null; then
     log "上个月流量: 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX")"
 fi
