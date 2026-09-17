@@ -3,12 +3,16 @@
 # ==========================================
 # 流量监控自动部署脚本 (通用任意平台 / 可选 Telegram 通知)
 # 功能：
-# 1. 自动获取网卡，只监控出站流量 (TX)
+# 1. 自动获取网卡，分别统计上下行流量 (RX 入站 / TX 出站)，超限口径可配置
 # 2. 运行 check_traffic.sh 时终端显示精确流量，日志保留简略信息
 # 3. 每月重置流量并删除旧的监控日志
 # 4. 超限后双向封锁 (INPUT + OUTPUT + FORWARD DROP)，仅保留 SSH(入/出双向永放行)/DNS/lo
 # 5. oracle 平台自动停用 firewalld / ufw，避免与 iptables 冲突
 # 6. TG 通知（可选）：断网前发一条、每月1号恢复发一条
+#
+# 【流量口径 STAT_MODE】写入 /etc/netMonitor.conf，可用 edit 子命令修改：
+#   out  -> 只算出站(上行)   in -> 只算入站(下行)
+#   max -> 取上下行中较大者  sum -> 上下行之和(总流量)
 #
 # 【配置方式】
 # 部署时的全部配置写入 ${CONF_FILE}（即 /etc/netMonitor.conf）。
@@ -86,6 +90,19 @@ resolve_limit() {
 }
 LIMIT="$(resolve_limit)"
 
+# 流量统计口径（超限判断用哪个方向的流量）：
+#   out  -> 只算出站(上行)   in  -> 只算入站(下行)
+#   max -> 取上下行中较大者  sum -> 上下行之和 (总流量)
+# 平台默认（首次部署时写入 conf，可用 edit 子命令改）：
+#   gcp/out 出站、oracle/in 入站、其他平台 sum 总和 —— 与平台计费口径一一对应。
+# 流量统计口径（超限判断用哪个方向的流量）：
+#   in  -> 只算入站(下行)   out -> 只算出站(上行)
+#   max -> 取上下行较大者    min -> 取上下行较小者   sum -> 上下行总和 (总流量)
+# 首次部署未显式设置时统一取 sum（总和）——不再按平台自动分派；
+# 要改成 in/out/max/min 请用 edit 子命令（会同步写入 conf 供运行时读取）。
+STAT_MODE="${STAT_MODE:-sum}"
+case "$STAT_MODE" in in|out|max|min|sum) : ;; *) STAT_MODE=sum ;; esac
+
 # 按地址族解析 DNS 默认值（纯函数，供测试用；仅当 DNS_SERVERS 为空时调用）
 resolve_dns() {
     if [ "$HAS_V4" = "0" ] && [ "$HAS_V6" = "1" ]; then
@@ -155,6 +172,7 @@ write_conf() {
 # 更换 TG 凭据也可用：bash traffic_ctrl.sh set-tg
 PLATFORM="$PLATFORM"
 LIMIT=$LIMIT
+STAT_MODE=$STAT_MODE
 SSH_PORT=$SSH_PORT
 DNS_SERVERS="$DNS_SERVERS"
 HAS_V4=$HAS_V4
@@ -181,6 +199,7 @@ tg_set() {
     # 读取现有配置以保留其余字段
     . "$CONF_FILE"
     INTERFACE="${INTERFACE:-}"
+    STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
     gen_key
@@ -196,6 +215,7 @@ tg_clear() {
     fi
     . "$CONF_FILE"
     INTERFACE="${INTERFACE:-}"
+    STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
     TELEGRAM_BOT_TOKEN=""
@@ -225,6 +245,7 @@ config_show() {
     echo "======== netMonitor 当前配置 ========"
     echo "平台         : ${PLATFORM:-gcp}"
     echo "流量上限     : ${LIMIT:-180} GB"
+    echo "流量口径     : ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 sum=总和)"
     echo "SSH 端口     : ${SSH_PORT:-22}"
     echo "DNS 服务器   : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
     echo "网卡接口     : ${INTERFACE:-}"
@@ -252,8 +273,10 @@ config_edit() {
     TELEGRAM_BOT_TOKEN_ENC="${TELEGRAM_BOT_TOKEN_ENC:-}"
     TELEGRAM_CHAT_ID_ENC="${TELEGRAM_CHAT_ID_ENC:-}"
     INTERFACE="${INTERFACE:-}"
+    STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
+    case "$STAT_MODE" in out|in|max|sum) : ;; *) STAT_MODE=out ;; esac
 
     # 解密现有 TG 以便编辑后原样回写（不输入即保留）
     local t c
@@ -265,16 +288,17 @@ config_edit() {
         echo "======== netMonitor 配置修改菜单 ========"
         echo "  平台 PLATFORM    : ${PLATFORM:-gcp}"
         echo "  流量上限 LIMIT   : ${LIMIT:-180} GB"
+        echo "  流量口径 STAT_MODE: ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 sum=总和)"
         echo "  SSH 端口         : ${SSH_PORT:-22}"
         echo "  DNS 服务器       : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
         echo "  网卡接口         : ${INTERFACE:-}"
         echo "  TG 通知          : $([ -n "$t" ] && [ -n "$c" ] && echo "已启用" || echo "未启用")"
         echo "========================================"
         echo " 1) 修改平台         2) 修改流量上限"
-        echo " 3) 修改 SSH 端口    4) 修改 DNS 服务器"
-        echo " 5) 修改网卡接口     6) 修改 TG 凭据"
-        echo " 7) 清空 TG 凭据     8) 保存并退出"
-        echo " 0) 不保存退出"
+        echo " 3) 修改流量口径     4) 修改 SSH 端口"
+        echo " 5) 修改 DNS 服务器  6) 修改网卡接口"
+        echo " 7) 修改 TG 凭据     8) 清空 TG 凭据"
+        echo " 9) 保存并退出       0) 不保存退出"
         echo "========================================"
         printf "请选择: "
         read -r opt || break
@@ -289,29 +313,37 @@ config_edit() {
                 [ -n "$v" ] && LIMIT="$v"
                 ;;
             3)
+                printf "流量口径: out(出站) in(入站) max(取大) sum(总和) [${STAT_MODE:-sum}]: "; read -r v
+                case "$v" in
+                    out|in|max|min|sum) STAT_MODE="$v" ;;
+                    "") : ;;
+                    *) echo "无效口径，保留 ${STAT_MODE:-sum}。" ;;
+                esac
+                ;;
+            4)
                 printf "新 SSH 端口 [${SSH_PORT:-22}]: "; read -r v
                 [ -n "$v" ] && SSH_PORT="$v"
                 ;;
-            4)
+            5)
                 printf "新 DNS 服务器(空格分隔) [${DNS_SERVERS:-8.8.8.8 8.8.4.4}]: "; read -r v
                 [ -n "$v" ] && DNS_SERVERS="$v"
                 ;;
-            5)
+            6)
                 printf "新网卡接口 [${INTERFACE:-}]: "; read -r v
                 [ -n "$v" ] && INTERFACE="$v"
                 ;;
-            6)
+            7)
                 printf "新 Bot Token (留空保持不变): "; read -rs t2; echo
                 printf "新 Chat ID (留空保持不变): "; read -rs c2; echo
                 [ -n "$t2" ] && t="$t2"
                 [ -n "$c2" ] && c="$c2"
                 ;;
-            7)
+            8)
                 t=""
                 c=""
                 echo "-> TG 凭据已清空"
                 ;;
-            8)
+            9)
                 TELEGRAM_BOT_TOKEN="$t"
                 TELEGRAM_CHAT_ID="$c"
                 gen_key
@@ -473,95 +505,105 @@ fi
 
 # 3. 生成独立流量统计脚本 (/root/netstat.sh)
 #    算法与哪吒探针(nezha)一致：直接读 /proc/net/dev，排除虚拟网卡(lo/docker/veth/br-等)，
-#    对剩余全部物理网卡的 TX 求和作为"当前出站累计"；通过与上次快照求差得到增量，
-#    累加到当月累计（快照回绕/服务器重启时增量归零重新累计），彻底摆脱对 vnstatd 的依赖。
-#    供下方 heredoc 展开的绝对路径（check/reset 内 get_monthly_tx 调用统一用此变量）
+#    对剩余全部物理网卡的 RX(下行)/TX(上行) 分别求和作为"当前累计"；
+#    通过与上次快照求差得到增量，分别累加到当月 RX/TX 累计
+#   （快照回绕/服务器重启时增量归零重新累计），彻底摆脱对 vnstatd 的依赖。
+#    供下方 heredoc 展开的绝对路径（check/reset 内统计调用统一用此变量）
 NETSTAT_BIN="/root/netstat.sh"
 echo "--> 生成独立流量统计脚本 /root/netstat.sh..."
 cat > /root/netstat.sh <<'NETSTAT'
 #!/bin/bash
-# netstat.sh - 独立出站流量统计 (nezha 式 /proc/net/dev + 月度增量)
+# netstat.sh - 独立流量统计 (nezha 式 /proc/net/dev + 月度增量, 上下行分开)
 # 用法:
-#   /root/netstat.sh            输出当月累计出站字节 (纯数字)
+#   /root/netstat.sh            输出当月累计字节: "上行(TX) 下行(RX)" (空格分隔, 两值)
+#   /root/netstat.sh --out       只输出当月上行累计 (单值)
+#   /root/netstat.sh --in       只输出当月下行累计 (单值)
 #   /root/netstat.sh --reset    清零当月累计 (每月1号由 reset_network.sh 调用)
 #   /root/netstat.sh --current  输出当前网卡累计快照 (调试用)
-#   两种用法均会更新/持久化快照。状态文件: /var/lib/traffic_monitor/netcount
+#   每次调用都是"采样"：会推进快照、更新/持久化状态。状态文件: /var/lib/traffic_monitor/netcount
 
 set -u
 STATE_DIR="/var/lib/traffic_monitor"
 COUNT_FILE="$STATE_DIR/netcount"
 CUR_MONTH=$(date '+%Y-%m')
 
-# 排除的虚拟网卡标识 (与 nezha 过滤规则对齐)
-is_virtual() {
-    local n="$1"
-    case "$n" in
-        lo|docker*|veth*|br-*|virbr*|tun*|tap*|vbox*|dummy*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# 读 /proc/net/dev, 对所有"非虚拟"网卡的 TX (第 10 列) 求和
-current_tx() {
+# 读 /proc/net/dev, 对所有"非虚拟"网卡分别按 RX(第2列) / TX(第10列) 求和
+# 输出: "<TX累计> <RX累计>"
+current_counters() {
     awk '
         /^[[:space:]]*[a-zA-Z0-9_@.-]+:/ {
             iface=$1; sub(/:/,"",iface)
             if (iface=="lo" || iface ~ /^docker/ || iface ~ /^veth/ || iface ~ /^br-/ \
                 || iface ~ /^virbr/ || iface ~ /^tun/ || iface ~ /^tap/ || iface ~ /^vbox/ \
                 || iface ~ /^dummy/) next
-            sum += $10
+            out += $10
+            in += $2
         }
-        END { print sum+0 }
+        END { printf "%d %d\n", out+0, in+0 }
     ' /proc/net/dev
 }
 
 mkdir -p "$STATE_DIR"
-CUR=$(current_tx)
-
-if [ "${1:-}" = "--current" ]; then
-    echo "$CUR"
-    exit 0
-fi
+read -r CUR_TX CUR_RX <<< "$(current_counters)"
 
 # 读取上次状态
-LAST=0; MONTH_TX=0; MONTH=""
+LAST_TX=0; LAST_RX=0; MONTH_TX=0; MONTH_RX=0; MONTH=""
 [ -f "$COUNT_FILE" ] && . "$COUNT_FILE"
 
 # 跨月: 清零当月累计 (新计费周期), 快照保留为下次 delta 基准
 if [ "$MONTH" != "$CUR_MONTH" ]; then
     MONTH_TX=0
+    MONTH_RX=0
     MONTH="$CUR_MONTH"
 fi
 
 if [ "${1:-}" = "--reset" ]; then
     MONTH_TX=0
+    MONTH_RX=0
     MONTH="$CUR_MONTH"
-    LAST=$CUR
+    LAST_TX=$CUR_TX
+    LAST_RX=$CUR_RX
     cat > "$COUNT_FILE" <<EOF
 MONTH=$MONTH
 MONTH_TX=$MONTH_TX
-LAST=$LAST
+MONTH_RX=$MONTH_RX
+LAST_TX=$LAST_TX
+LAST_RX=$LAST_RX
 EOF
-    echo "$MONTH_TX"
+    echo "0 0"
     exit 0
 fi
 
-# 求增量: 快照回绕(重启)时 delta 归零重计, 与 nezha min() 语义一致
-if [ "$LAST" -eq 0 ] || [ "$CUR" -lt "$LAST" ]; then
-    DELTA=$CUR
+# 求增量: 快照回绕(重启)时 delta 归零重计, 与 nezha min() 语义一致 (上下行独立)
+if [ "$LAST_TX" -eq 0 ] || [ "$CUR_TX" -lt "$LAST_TX" ]; then
+    DELTA_TX=$CUR_TX
 else
-    DELTA=$(( CUR - LAST ))
+    DELTA_TX=$(( CUR_TX - LAST_TX ))
 fi
-MONTH_TX=$(( MONTH_TX + DELTA ))
-LAST=$CUR
+if [ "$LAST_RX" -eq 0 ] || [ "$CUR_RX" -lt "$LAST_RX" ]; then
+    DELTA_RX=$CUR_RX
+else
+    DELTA_RX=$(( CUR_RX - LAST_RX ))
+fi
+MONTH_TX=$(( MONTH_TX + DELTA_TX ))
+MONTH_RX=$(( MONTH_RX + DELTA_RX ))
+LAST_TX=$CUR_TX
+LAST_RX=$CUR_RX
 
 cat > "$COUNT_FILE" <<EOF
 MONTH=$MONTH
 MONTH_TX=$MONTH_TX
-LAST=$LAST
+MONTH_RX=$MONTH_RX
+LAST_TX=$LAST_TX
+LAST_RX=$LAST_RX
 EOF
 
-echo "$MONTH_TX"
+case "${1:-}" in
+    --out) echo "$MONTH_TX" ;;
+    --in) echo "$MONTH_RX" ;;
+    --current) current_counters ;;
+    *)    echo "$MONTH_TX $MONTH_RX" ;;
+esac
 NETSTAT
 chmod +x /root/netstat.sh
 # 立即初始化快照 (--reset：当月累计=0、快照=当前累计；此后每5分钟增量累计)
@@ -740,19 +782,29 @@ tg_send() {
 }
 
 # ==========================================
-# 获取当月累计出站流量 (返回原始字节数)
-# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量)
-# 注意: 调用 netstat.sh 本身就是一次"采样"(其内部会推进快照计算增量),
-#       必须只调用一次并把结果复用, 避免同一 cron 周期多次采样导致累计翻倍。
+# 读取当月上下行累计 (调用一次 netstat.sh = 一次采样)
+# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量, 上下行分开)
+# 注意: netstat.sh 每次调用都会推进快照，必须只调用一次并把结果复用，
+#       否则同一 cron 周期多次采样会导致累计翻倍。
+# 设置: MONTH_TX / MONTH_RX (字节), 并按 STAT_MODE 计算 BAL_BYTES (超限判断口径)
+#   STAT_MODE: out=出站 in=入站 max=取大 sum=总和
 # ==========================================
 NETSTAT_BIN="/root/netstat.sh"
-get_monthly_tx() {
-    local month_tx
-    month_tx=\$("$NETSTAT_BIN" 2>/dev/null)
-    if [ -z "\$month_tx" ] || ! [[ "\$month_tx" =~ ^[0-9]+$ ]]; then
-        month_tx=0
-    fi
-    echo "\$month_tx"
+read_traffic() {
+    local out
+    out=\$("$NETSTAT_BIN" 2>/dev/null)
+    # 输出格式: "上行(TX) 下行(RX)" 两值空格分隔
+    MONTH_TX=\${out%% *}
+    MONTH_RX=\${out##* }
+    if ! [[ "\$MONTH_TX" =~ ^[0-9]+$ ]]; then MONTH_TX=0; fi
+    if ! [[ "\$MONTH_RX" =~ ^[0-9]+$ ]]; then MONTH_RX=0; fi
+    case "\$STAT_MODE" in
+        in)  BAL_BYTES=\$MONTH_RX ;;
+        max) [ "\$MONTH_TX" -ge "\$MONTH_RX" ] && BAL_BYTES=\$MONTH_TX || BAL_BYTES=\$MONTH_RX ;;
+        min) [ "\$MONTH_TX" -le "\$MONTH_RX" ] && BAL_BYTES=\$MONTH_TX || BAL_BYTES=\$MONTH_RX ;;
+        sum) BAL_BYTES=\$(( MONTH_TX + MONTH_RX )) ;;
+        *)   BAL_BYTES=\$MONTH_TX ;;
+    esac
 }
 
 # ==========================================
@@ -797,18 +849,12 @@ get_cpu_type() {
 }
 
 # ==========================================
-# 获取当月累计出站流量 (字节)
-# 由独立统计脚本 netstat.sh 计算 (nezha 式 /proc/net/dev + 月度增量)
+# 读取一次当月上下行累计 (单次采样, 含 STAT_MODE 计费口径计算)
 # ==========================================
-TX_BYTES=\$("$NETSTAT_BIN" 2>/dev/null)
+read_traffic
 
-# 如果获取失败或为空，默认为 0 (netstat.sh 正常输出纯数字; 任何异常归 0)
-if [[ -z "\$TX_BYTES" ]] || ! [[ "\$TX_BYTES" =~ ^[0-9]+$ ]]; then
-    TX_BYTES=0
-fi
-
-# 将字节转换为 GB (1 GB = 1073741824 Bytes)
-TX_GB=\$(echo "scale=2; \$TX_BYTES / 1073741824" | bc)
+# 计费口径换算成 GB (1 GB = 1073741824 Bytes)
+BAL_GB=\$(echo "scale=2; \$BAL_BYTES / 1073741824" | bc)
 
 # ==========================================
 # 1. 终端直接输出 (显示精确数值)
@@ -816,8 +862,10 @@ TX_GB=\$(echo "scale=2; \$TX_BYTES / 1073741824" | bc)
 echo "========================================"
 echo " 网卡接口    : \$INTERFACE"
 echo " 当前时间    : \$(date '+%Y-%m-%d %H:%M:%S')"
-echo " 精确出站(TX): \$TX_BYTES Bytes"
-echo " 换算出站(TX): \$TX_GB GB"
+echo " 上行出站(TX): \$(format_traffic "\$MONTH_TX") (\$MONTH_TX Bytes)"
+echo " 下行入站(RX): \$(format_traffic "\$MONTH_RX") (\$MONTH_RX Bytes)"
+echo " 计费口径    : \$STAT_MODE (out=出站 in=入站 max=取大 sum=总和)"
+echo " 计费流量    : \$(format_traffic "\$BAL_BYTES") (\$BAL_BYTES Bytes)"
 echo " 流量上限    : \$LIMIT GB"
 echo "========================================"
 
@@ -825,7 +873,7 @@ echo "========================================"
 # 2. 日志记录与限制逻辑
 # ==========================================
 
-log "当前出站流量: \$TX_GB GB (限制: \$LIMIT GB)"
+log "当前计费流量(\$STAT_MODE): \$(format_traffic "\$BAL_BYTES") / 上限: \$LIMIT GB (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))"
 
 # 读取当月状态 (默认 normal)
 CUR_MONTH=\$(date '+%Y-%m')
@@ -853,9 +901,9 @@ RESTORED_TIME="\$RESTORED_TIME"
 STATE_EOF
 }
 
-# 检查是否超限 (用字节级精度比较, 支持 GB 小数上限如 0.001=1MB, 避免 TX_GB 浮点取整误判)
+# 检查是否超限 (用字节级精度比较, 支持 GB 小数上限如 0.001=1MB, 避免 BAL_GB 浮点取整误判)
 LIMIT_BYTES=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc)
-if [ \$(echo "\$TX_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
+if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
     echo "状态: [警告] 流量已超限，正在禁止出站..."
     log "警告：流量超出限制！正在执行封网策略 (双向封锁)..."
 
@@ -863,14 +911,13 @@ if [ \$(echo "\$TX_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
     if [ "\$STATE" != "blocked" ]; then
         STATE=blocked
         BLOCKED_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
-        BLOCKED_TX="\$TX_BYTES"
+        BLOCKED_TX="\$BAL_BYTES"
         save_state
 
         # 超限时发送 TG 通知 (TG 启用时)
         if [ "\$TG_ON" = "1" ]; then
             IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
             RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
-            MONTH_TX=\$TX_BYTES
             # CPU 行 (仅 oracle 显示)
             CPU_LINE=""
             if is_oracle_platform; then
@@ -884,7 +931,8 @@ TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 正常 ---> 超限(双向封网)
-🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${CPU_LINE}"
+📊 计费口径: \$STAT_MODE (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))
+🌐 计费流量: \$(format_traffic "\$BAL_BYTES") / 上限: \$LIMIT GB\${CPU_LINE}"
 
             tg_send "\$TG_MSG"
             log "已发送流量超限 TG 通知。"
@@ -1075,16 +1123,16 @@ get_ip_and_loc() {
     echo "\${masked}|\${loc}|\${ip}"
 }
 
-# 获取当月累计出站流量 (返回原始字节数)
+# 采样当月上下行累计 (返回 "上行(TX) 下行(RX)" 两值)
 # 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量)
 # 注意: 必须在 reset 前调用一次 (采样当月最终值), reset 会清零计数。
-get_monthly_tx() {
-    local month_tx
-    month_tx=\$("/root/netstat.sh" 2>/dev/null)
-    if [ -z "\$month_tx" ] || ! [[ "\$month_tx" =~ ^[0-9]+$ ]]; then
-        month_tx=0
-    fi
-    echo "\$month_tx"
+read_traffic_last() {
+    local out
+    out=\$("/root/netstat.sh" 2>/dev/null)
+    LAST_MONTH_TX=\${out%% *}
+    LAST_MONTH_RX=\${out##* }
+    if ! [[ "\$LAST_MONTH_TX" =~ ^[0-9]+$ ]]; then LAST_MONTH_TX=0; fi
+    if ! [[ "\$LAST_MONTH_RX" =~ ^[0-9]+$ ]]; then LAST_MONTH_RX=0; fi
 }
 
 # 流量格式化: 按 MB -> GB -> TB 层级递进
@@ -1163,10 +1211,10 @@ unblock_fw() {
 log "已移除本脚本的封网规则 (TRAFFIC_BLOCKED)，网络恢复。"
 
 # 3. 重置流量统计 (nezha 式 netstat.sh 清零当月累计)
-#    在重置前先采样"上个月"最终出站流量 (reset 后计数清零，用于恢复通知展示)
-LAST_MONTH_TX=\$(get_monthly_tx)
-if [ -n "\$LAST_MONTH_TX" ] && [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null; then
-    log "上个月出站流量: \$(format_traffic "\$LAST_MONTH_TX") (\$LAST_MONTH_TX Bytes)"
+#    在重置前先采样"上个月"最终上下行流量 (reset 后计数清零，用于恢复通知展示)
+read_traffic_last
+if [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null || [ "\$LAST_MONTH_RX" -gt 0 ] 2>/dev/null; then
+    log "上个月流量: 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX")"
 fi
 /root/netstat.sh --reset >/dev/null 2>&1 || true
 log "流量统计已重置 (netstat.sh 当月累计清零)。"
@@ -1197,13 +1245,11 @@ STATE_EOF
 if [ "\$NEED_RESTORE" -eq 1 ]; then
 IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
     RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
-    MONTH_TX=\$(get_monthly_tx)
-    # 上个月(重置前周期)最终流量: 优先用步骤3采样值, 若为0则回退到 max(当前,采样)
+    MONTH_TX=0
+    MONTH_RX=0
+    # 上个月(重置前周期)最终流量: 步骤3已采样 (LAST_MONTH_TX/RX)
     LAST_MONTH_OK=0
-    if [ -n "\$LAST_MONTH_TX" ] && [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null; then
-        LAST_MONTH_OK=1
-    elif [ "\$MONTH_TX" -gt 0 ] 2>/dev/null; then
-        LAST_MONTH_TX="\$MONTH_TX"
+    if [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null || [ "\$LAST_MONTH_RX" -gt 0 ] 2>/dev/null; then
         LAST_MONTH_OK=1
     fi
     # CPU 行 (仅 oracle 显示)
@@ -1213,11 +1259,11 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 CPU: \$(get_cpu_type)"
     fi
 
-    # 本月流量/上限 恒显示; 有上月(重置前)记录时附加展示
+    # 本月流量/上限 恒显示 (重置已清零, 本月为 0); 有上月(重置前)记录时附加展示
     LAST_MONTH_LINE=""
     if [ "\$LAST_MONTH_OK" = "1" ]; then
         LAST_MONTH_LINE="
-📊 上个月流量: \$(format_traffic "\$LAST_MONTH_TX") (重置前出站耗尽)"
+📊 上个月流量: 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX") (重置前耗尽)"
     fi
 
     TG_MSG="🎮 \$PLATFORM 流量报告（网络恢复通知）
@@ -1225,7 +1271,7 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 超限封网 ---> 已恢复
-🌐 本月流量: \$(format_traffic "\$MONTH_TX") / 上限: \$LIMIT GB\${LAST_MONTH_LINE}\${CPU_LINE}"
+🌐 本月流量: 上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX") / 上限: \$LIMIT GB\${LAST_MONTH_LINE}\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
     log "已发送网络恢复 TG 通知。"
