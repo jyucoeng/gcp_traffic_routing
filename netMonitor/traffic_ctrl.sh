@@ -724,8 +724,8 @@ VNSTAT_RAW=\$(vnstat -i "\$INTERFACE" --oneline b 2>/dev/null)
 # 提取出站流量 (TX)，第 10 个字段
 TX_BYTES=\$(echo "\$VNSTAT_RAW" | cut -d ';' -f 10)
 
-# 如果获取失败或为空，默认为 0
-if [[ -z "\$TX_BYTES" ]]; then
+# 如果获取失败或为空，默认为 0 (vnstat 无数据时会输出 "No data" 提示而非数字, 同样归 0)
+if [[ -z "\$TX_BYTES" ]] || ! [[ "\$TX_BYTES" =~ ^[0-9]+$ ]]; then
     TX_BYTES=0
 fi
 
