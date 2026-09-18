@@ -5,26 +5,30 @@
 # 功能：
 # 1. 自动获取网卡，分别统计上下行流量 (RX 入站 / TX 出站)，超限口径可配置
 # 2. 运行 check_traffic.sh 时终端显示精确流量，日志保留简略信息
-# 3. 每月重置流量并删除旧的监控日志
+# 3. 每月重置流量，并清理旧日志（只保留最近 N 天，默认 7 天，可配 LOG_RETENTION_DAYS）
 # 4. 超限后双向封锁 (INPUT + OUTPUT + FORWARD DROP)，仅保留 SSH(入/出双向永放行)/DNS/lo
 # 5. oracle 平台自动停用 firewalld / ufw，避免与 iptables 冲突
 # 6. TG 通知（可选）：断网前发一条、每月1号恢复发一条
 #
-# 【流量口径 STAT_MODE】写入 /etc/netMonitor.conf，可用 edit 子命令修改：
+# 【流量口径 STAT_MODE】写入 ${CONF_DIR}/netMonitor.conf（默认 /etc/traffic_routing/netMonitor.conf），可用 edit 子命令修改：
 #   out  -> 只算出站(上行)   in -> 只算入站(下行)
 #   max -> 取上下行中较大者  sum -> 上下行之和(总流量)
 #
 # 【配置方式】
-# 部署时的全部配置写入 ${CONF_FILE}（即 /etc/netMonitor.conf）。
+# 部署时的全部配置写入 CONF_DIR 下的 netMonitor.conf（默认 /etc/traffic_routing/netMonitor.conf）。
 # TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 不明文保存：部署时用 AES-256 加密
-# （密钥在 ${NETMON_KEY}，即 /etc/netMonitor.key，权限 0600）后以 *_ENC 字段写入。
+# （密钥在 CONF_DIR 下的 netMonitor.key，权限 0600）后以 *_ENC 字段写入。
 # 运行时脚本用密钥文件解密后使用，密码不落盘、不出现在命令行参数。
 #
 # 之后修改配置【统一通过子命令，勿直接手改文件】：
-#   bash traffic_ctrl.sh edit       # 交互式菜单：改平台/上限/端口/DNS/网卡/TG
+#   bash traffic_ctrl.sh            # 不加参数 = 进入管理菜单（部署/查看/修改/卸载/退出）
+#   bash traffic_ctrl.sh req        # 部署 / 重新部署（覆盖式，先卸后装；LIMIT 必须显式指定）
+#   bash traffic_ctrl.sh edit       # 交互式菜单：改平台/上限/端口/DNS/网卡/TG/日志保留
 #   bash traffic_ctrl.sh set-tg     # 更换 TG（从环境变量 TELEGRAM_BOT_TOKEN/CHAT_ID 读取）
 #   bash traffic_ctrl.sh clear-tg   # 停用并清除 TG 凭据
 #   bash traffic_ctrl.sh config     # 查看当前配置（TG 凭据以掩码显示）
+#   bash traffic_ctrl.sh del        # 卸载（保留密钥与月度档案）
+#   bash traffic_ctrl.sh help       # 查看全部命令用法
 #
 # 平台差异通过 PLATFORM 区分（建议统一小写）：
 # 自动停用 firewalld/ufw
@@ -64,10 +68,22 @@ DNS_SERVERS="${DNS_SERVERS:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
-# 运行时配置文件路径（一般无需改动；需共享配置时可重定向）
-CONF_FILE="${CONF_FILE:-/etc/netMonitor.conf}"
+# 运行时脚本目录：生成的 check/reset/netstat 三个脚本统一收拢于此，
+# 部署流程会提前 mkdir -p 创建（覆盖式重装/升级时复用同一目录）
+SCRIPT_DIR="${SCRIPT_DIR:-/root/traffic_routing}"
+# 运行时配置目录：conf/key 统一收拢于此，方便以后整体迁移；
+# 部署流程会提前 mkdir -p 创建，uninstall 会清理此目录下的本脚本文件
+CONF_DIR="${CONF_DIR:-/etc/traffic_routing}"
+# 运行时配置文件路径（一般通过 CONF_DIR 派生；需共享配置时可单独重定向 CONF_FILE）
+CONF_FILE="${CONF_FILE:-$CONF_DIR/netMonitor.conf}"
 # TG 凭据加密密钥文件（0600，root-only；丢失后凭据不可恢复，需重新 set-tg）
-NETMON_KEY="${NETMON_KEY:-/etc/netMonitor.key}"
+NETMON_KEY="${NETMON_KEY:-$CONF_DIR/netMonitor.key}"
+# 流量监控日志保留天数：每月 1 号 reset_network.sh 清理时，只保留最近 N 天的日志行，
+# 删除 N 天以前的旧日志（默认 7 天）；0/-1 = 保留全部不清理。
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
+case "$LOG_RETENTION_DAYS" in
+    ''|*[!0-9-]*|-) LOG_RETENTION_DAYS=7 ;;
+esac
 # ==========================================
 
 # TG 通知开关：两者均非空才启用
@@ -81,17 +97,8 @@ is_oracle_platform() {
     echo "$PLATFORM" | grep -qiE 'oracle|甲骨文'
 }
 
-# 若未手动设置 LIMIT，则按平台取默认值（纯函数，供测试用）
-resolve_limit() {
-    if [ -n "${LIMIT:-}" ]; then
-        echo "$LIMIT"
-    elif is_oracle_platform; then
-        echo 9216
-    else
-        echo 180
-    fi
-}
-LIMIT="$(resolve_limit)"
+# LIMIT 无任何默认值：部署时必须显式给出（环境变量 LIMIT 或 edit 菜单项 2 修改）。
+# 语义：0/-1 = 无限制（永不触发封网）；>0 = 上限 GB。未设置时部署流程直接报错退出。
 
 # 流量统计口径（超限判断用哪个方向的流量）：
 #   out  -> 只算出站(上行)   in  -> 只算入站(下行)
@@ -125,36 +132,12 @@ require_root() {
     fi
 }
 
-# ==========================================
-# 卸载函数（del 子命令；覆盖式安装=先卸再装时复用清理）
-# 只清理"本脚本自己在部署期落下的部署物"：
-#   - crontab 里 check_traffic.sh / reset_network.sh 两条调度
-#   - 部署生成的 /root/check_traffic.sh 与 /root/reset_network.sh（两层 heredoc 副本各有一份，都在 /root）
-#   - 运行时配置 /etc/netMonitor.conf 与其 0600 父目录
-#   - 解密的运行密钥 /etc/netMonitor.key（TG 凭据 AES 密钥，丢失后不可恢复）
-#   - 运行时状态 /var/lib/traffic_monitor/ 与 /var/log/netMonitor*.log
-# 不动宿主系统其他 crontab 条目 / iptables 规则 / 默认策略。
-# 幂等：任意步骤缺失即跳过，可重复调用（覆盖式安装 / del 通用）。
-# 提示：外层文件自身还会把 AUTHER/VERSION 常量写进 conf heredoc 落盘，
-#       本函数一并清掉这些副本生成物，保证卸载后不留脚本痕迹。
-uninstall() {
-    # crontab 仅移除本脚本两条调度，保留其他任务
-    if command -v crontab >/dev/null 2>&1; then
-        crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
-    fi
-    # 移除两层 heredoc 副本生成的部署脚本（都在 /root）
-    rm -f /root/check_traffic.sh /root/reset_network.sh 2>/dev/null || true
-    # 移除运行时配置、密钥、状态、日志
-    rm -rf /etc/netMonitor.conf /etc/netMonitor.key /var/lib/traffic_monitor 2>/dev/null || true
-    rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
-    echo "  -> netMonitor 已卸载，原部署物已清理；可随时重新部署（覆盖式安装会自动先卸再装）。"
-}
-
 # ==================================================
 # 卸载函数（del 子命令 / 覆盖式安装共用）
 # 只清理"本脚本自己的部署物"，不动宿主其他 crontab/iptables 规则；
 # 覆盖式安装 = 部署流程先调用本函数清掉旧物，再重新完整部署。
 # 本函数仅属外层部署器；两份 heredoc 生成的 check/reset 是独立运行时脚本，无需各自的 uninstall。
+# 保留项：NETMON_KEY（TG 凭据 AES 密钥，覆盖式重装复用，免重配 TG）与月度档案 archive（历史流量长期留存）。
 # ==================================================
 uninstall() {
     # 1. 从 crontab 移除本脚本的两条调度（只删含 check_traffic/reset_network 的行，保留其他任务）
@@ -162,18 +145,22 @@ uninstall() {
         crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
     fi
 
-    # 2. 删除部署时生成的两份运行时脚本
-    rm -f /root/check_traffic.sh /root/reset_network.sh
+    # 2. 删除部署时生成的运行时脚本（SCRIPT_DIR；兼容清理旧版 /root 直放路径）
+    rm -f "$SCRIPT_DIR/check_traffic.sh" "$SCRIPT_DIR/reset_network.sh" "$SCRIPT_DIR/netstat.sh" 2>/dev/null || true
+    rm -f /root/check_traffic.sh /root/reset_network.sh /root/netstat.sh 2>/dev/null || true
+    rmdir "$SCRIPT_DIR" 2>/dev/null || true
 
-    # 3. 删除运行时配置与 TG 密钥（避免残留旧平台/旧凭据）
+    # 3. 删除运行时配置（保留 NETMON_KEY：覆盖式重装复用 TG 密钥；兼容删旧版硬编码路径）
     [ -n "${CONF_FILE:-}" ] && rm -f "$CONF_FILE"
-    [ -n "${NETMON_KEY:-}" ] && rm -f "$NETMON_KEY"
+    rm -f /etc/netMonitor.conf 2>/dev/null || true
+    [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
 
-    # 4. 删除运行时状态/计数/日志
-    rm -rf /var/lib/traffic_monitor /var/lib/traffic_monitor_archive 2>/dev/null || true
+    # 4. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
+    rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/netcount 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
+    rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
 
-    echo "  -> 已卸载（旧部署物已清理；如需重新部署请直接 bash $0 执行覆盖式安装）。"
+    echo "  -> 已卸载（旧部署物已清理，密钥与月度档案保留；如需重新部署请直接 bash $0 执行覆盖式安装）。"
 }
 
 # 生成密钥文件（首次使用时；已存在则复用）
@@ -219,6 +206,7 @@ mask_mid() {
 # 生成全部运行时配置（部署与 set-tg 共用）
 write_conf() {
     umask 077
+    mkdir -p "$(dirname "$CONF_FILE")"
     cat > "$CONF_FILE" <<EOF
 # netMonitor 运行时配置
 # 修改配置请用：bash traffic_ctrl.sh edit（交互式菜单）；请勿手改本文件
@@ -237,6 +225,8 @@ VERSION="$VERSION"
 TELEGRAM_BOT_TOKEN_ENC="$(enc_tg "$TELEGRAM_BOT_TOKEN")"
 TELEGRAM_CHAT_ID_ENC="$(enc_tg "$TELEGRAM_CHAT_ID")"
 INTERFACE="$INTERFACE"
+# 流量监控日志保留天数：每月 1 号清理时只保留最近 N 天的日志（0/-1=保留全部）
+LOG_RETENTION_DAYS=$LOG_RETENTION_DAYS
 EOF
     chmod 0600 "$CONF_FILE"
 }
@@ -259,6 +249,7 @@ tg_set() {
     STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
+    LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
     gen_key
     write_conf
     echo "TG 凭据已更新（加密写入 ${CONF_FILE}）。"
@@ -275,6 +266,7 @@ tg_clear() {
     STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
+    LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
     TELEGRAM_BOT_TOKEN=""
     TELEGRAM_CHAT_ID=""
     gen_key
@@ -299,14 +291,18 @@ config_show() {
     t="$(dec_tg "$TELEGRAM_BOT_TOKEN_ENC")"
     c="$(dec_tg "$TELEGRAM_CHAT_ID_ENC")"
 
-    echo "======== netMonitor 当前配置 ========"
-    echo " 作者/版本     : ${AUTHOR:-littleDoraemon}  ${VERSION:-v0.1.0}"
+    echo "========================="
+    echo " 小鸡流量限制管理脚本"
+    echo " Author：${AUTHOR}"
+    echo " Version: ${VERSION}"
+    echo "========================="
     echo "平台         : ${PLATFORM:-gcp}"
-    echo "流量上限     : ${LIMIT:-180} GB"
+    echo "流量上限     : ${LIMIT:-未设置} GB"
     echo "流量口径     : ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
     echo "SSH 端口     : ${SSH_PORT:-22}"
     echo "DNS 服务器   : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
     echo "网卡接口     : ${INTERFACE:-}"
+    echo "日志保留     : ${LOG_RETENTION_DAYS:-7} 天 (只保留最近 N 天, 0/-1=保留全部)"
     if [ -n "$t" ] && [ -n "$c" ]; then
         echo "TG 通知      : 已启用"
         echo "  BOT TOKEN  : $(mask_mid "$t")  (长度 ${#t})"
@@ -334,7 +330,11 @@ config_edit() {
     STAT_MODE="${STAT_MODE:-sum}"
     HAS_V4="${HAS_V4:-1}"
     HAS_V6="${HAS_V6:-1}"
-    case "$STAT_MODE" in out|in|max|sum) : ;; *) STAT_MODE=out ;; esac
+    LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
+    case "$STAT_MODE" in out|in|max|min|sum) : ;; *) STAT_MODE=sum ;; esac
+    case "$LOG_RETENTION_DAYS" in
+        ''|*[!0-9-]*|-) LOG_RETENTION_DAYS=7 ;;
+    esac
 
     # 解密现有 TG 以便编辑后原样回写（不输入即保留）
     local t c
@@ -343,20 +343,24 @@ config_edit() {
 
     while :; do
         echo ""
-        echo "======== netMonitor 配置修改菜单 ========"
-        echo " 作者/版本     : ${AUTHOR:-littleDoraemon}  ${VERSION:-v0.1.0}"
+        echo "========================="
+        echo " 小鸡流量限制管理脚本"
+        echo " Author：${AUTHOR}"
+        echo " Version: ${VERSION}"
+        echo "========================="
         echo "  平台 PLATFORM    : ${PLATFORM:-gcp}"
-        echo "  流量上限 LIMIT   : ${LIMIT:-180} GB"
+        echo "  流量上限 LIMIT   : ${LIMIT:-未设置} GB (0/-1=无限制)"
         echo "  流量口径 STAT_MODE: ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
         echo "  SSH 端口         : ${SSH_PORT:-22}"
         echo "  DNS 服务器       : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
         echo "  网卡接口         : ${INTERFACE:-}"
+        echo "  日志保留天数     : ${LOG_RETENTION_DAYS:-7} (只保留最近 N 天, 0/-1=保留全部)"
         echo "  TG 通知          : $([ -n "$t" ] && [ -n "$c" ] && echo "已启用" || echo "未启用")"
         echo "========================================"
-        echo " 1) 修改平台         2) 修改流量上限"
+        echo " 1) 修改平台         2) 修改流量上限(0/-1=无限制)"
         echo " 3) 修改流量口径     4) 修改 SSH 端口"
-        echo " 5) 修改 DNS 服务器  6) 修改网卡接口"
-        echo " 7) 修改 TG 凭据     8) 清空 TG 凭据"
+        echo " 5) 修改 DNS 服务器  6) 修改 TG 凭据"
+        echo " 7) 清空 TG 凭据     8) 修改日志保留天数"
         echo " 9) 保存并退出       0) 不保存退出"
         echo "========================================"
         printf "请选择: "
@@ -368,8 +372,14 @@ config_edit() {
                 [ -n "$v" ] && PLATFORM="$v"
                 ;;
             2)
-                printf "新上限 GB [${LIMIT:-180}]: "; read -r v
-                [ -n "$v" ] && LIMIT="$v"
+                printf "新上限 GB (0/-1=无限制，留空=不设置) [${LIMIT:-未设置}]: "; read -r v
+                case "$v" in
+                    "") LIMIT="" ;;
+                    -1) LIMIT="-1" ;;
+                    0)  LIMIT="0" ;;
+                    *[!0-9]*) echo "无效上限（仅允许非负整数，0/-1=无限制，留空=不设置）。" ;;
+                    *) LIMIT="$v" ;;
+                esac
                 ;;
             3)
                 printf "流量口径: out(出站) in(入站) max(取大) sum(总和) [${STAT_MODE:-sum}]: "; read -r v
@@ -388,19 +398,25 @@ config_edit() {
                 [ -n "$v" ] && DNS_SERVERS="$v"
                 ;;
             6)
-                printf "新网卡接口 [${INTERFACE:-}]: "; read -r v
-                [ -n "$v" ] && INTERFACE="$v"
-                ;;
-            7)
                 printf "新 Bot Token (留空保持不变): "; read -rs t2; echo
                 printf "新 Chat ID (留空保持不变): "; read -rs c2; echo
                 [ -n "$t2" ] && t="$t2"
                 [ -n "$c2" ] && c="$c2"
                 ;;
-            8)
+            7)
                 t=""
                 c=""
                 echo "-> TG 凭据已清空"
+                ;;
+            8)
+                printf "日志保留天数 (0/-1=保留全部) [${LOG_RETENTION_DAYS:-7}]: "; read -r v
+                case "$v" in
+                    "") : ;;
+                    -1) LOG_RETENTION_DAYS="-1" ;;
+                    0)  LOG_RETENTION_DAYS="0" ;;
+                    *[!0-9]*) echo "无效天数（仅允许非负整数，0/-1=保留全部）。" ;;
+                    *) LOG_RETENTION_DAYS="$v" ;;
+                esac
                 ;;
             9)
                 TELEGRAM_BOT_TOKEN="$t"
@@ -421,39 +437,94 @@ config_edit() {
     done
 }
 
-# ---------------- 入口分派 ----------------
-case "${1:-}" in
-    set-tg)
-        tg_set
-        exit 0
-        ;;
-    clear-tg)
-        tg_clear
-        exit 0
-        ;;
-    config)
-        config_show
-        exit 0
-        ;;
-    edit)
-        config_edit
-        exit 0
-        ;;
-    del)
-        uninstall
-        exit 0
-        ;;
-esac
+# ---------------- 子命令：menu / 默认入口 ----------------
+# 不加参数或 menu 子命令进入管理菜单（部署/查看/修改/卸载/退出）
+main_menu() {
+    require_root
+    while :; do
+        echo ""
+        echo "========================="
+        echo " 小鸡流量限制管理脚本"
+        echo " Author：${AUTHOR}"
+        echo " Version: ${VERSION}"
+        echo "========================="
+        echo " 1) 安装 / 覆盖安装"
+        echo " 2) 查看当前配置"
+        echo " 3) 修改配置（交互菜单）"
+        echo " 4) 设置/更换 TG 凭据"
+        echo " 5) 停用 TG 通知（清除凭据）"
+        echo " 6) 卸载（保留密钥与月度档案）"
+        echo " 0) 退出"
+        echo "========================="
+        printf "请选择: "
+        read -r opt || break
+
+        case "$opt" in
+            1)
+                do_install
+                ;;
+            2)
+                config_show
+                ;;
+            3)
+                config_edit
+                ;;
+            4)
+                printf "Bot Token (留空取消): "; read -rs t; echo
+                printf "Chat ID   (留空取消): "; read -rs _c; echo
+                if [ -n "$t" ] && [ -n "$_c" ]; then
+                    TELEGRAM_BOT_TOKEN="$t" TELEGRAM_CHAT_ID="$_c" tg_set
+                else
+                    echo "-> 未填写完整，已取消。"
+                fi
+                ;;
+            5)
+                tg_clear
+                ;;
+            6)
+                printf "确认卸载？部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
+                case "$a" in
+                    y|Y|yes|YES) uninstall ;;
+                    *) echo "-> 已取消。" ;;
+                esac
+                ;;
+            0|q|Q)
+                echo -e "\033[32m感谢使用本脚本，再见👋\033[0m"
+                break
+                ;;
+            *)
+                echo "无效选项，请重新选择。"
+                ;;
+        esac
+    done
+}
+
+# ---------------- 子命令：usage ----------------
+print_usage() {
+    cat <<'EOF'
+用法: bash traffic_ctrl.sh [命令]
+
+命令:
+  (无参数)         进入管理菜单（默认）
+  menu             显示管理菜单
+  req              部署 / 重新部署
+  edit             交互式修改配置（平台/上限/口径/端口/DNS/TG/日志保留）
+  config           查看当前配置（TG 凭据掩码显示）
+  set-tg           更换 TG 凭据：TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
+  clear-tg         停用并清除 TG 凭据
+  del              卸载（保留密钥与月度档案）
+  -h | --help | help  显示本帮助
+
+环境变量:
+  PLATFORM / LIMIT / STAT_MODE / SSH_PORT / DNS_SERVERS
+  LOG_RETENTION_DAYS / SCRIPT_DIR / CONF_DIR / TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+EOF
+}
 
 # ==========================================
-# 以下为完整部署流程
+# 以下为完整部署流程（do_install：req 子命令 / 菜单项 1 调用）
 # ==========================================
-
-# 测试模式：仅 source 函数定义，不执行部署/子命令（供 tests/smoke-netmon.sh）
-if [ "${NETMON_TEST_MODE:-0}" = "1" ]; then
-    return 0 2>/dev/null || exit 0
-fi
-
+do_install() {
 require_root
 
 # 0. 发行版 / 服务管理器 / 包管理器 探测
@@ -472,14 +543,20 @@ else
 fi
 echo "--> 检测到操作系统: $OS"
 
-# 1. 自动获取默认网卡名称（先 IPv4 默认路由，失败则回退 IPv6）
+# 1. 自动获取默认网卡名称（纯自动探测，不再接受手动指定；先 IPv4 默认路由，失败则回退 IPv6）
 INTERFACE=$(ip route 2>/dev/null | grep '^default' | awk '{print $5}' | head -n1)
 if [ -z "$INTERFACE" ]; then
     INTERFACE=$(ip -6 route 2>/dev/null | grep '^default' | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)
 fi
 
 if [ -z "$INTERFACE" ]; then
-    echo "错误：无法自动检测到网卡名称，请手动设置环境变量 INTERFACE。"
+    echo "错误：无法自动检测到网卡名称（本脚本为纯自动探测，不再接受手动指定 INTERFACE）。" >&2
+    exit 1
+fi
+
+# LIMIT 无默认值：未显式设置则直接报错（避免误用平台推断上限）
+if [ -z "${LIMIT:-}" ]; then
+    echo "错误：未设置 LIMIT（流量上限 GB）。请显式指定，例如：LIMIT=180 bash $0；0/-1 表示无限制。" >&2
     exit 1
 fi
 
@@ -566,23 +643,26 @@ if is_oracle_platform && [ "$SVC_MGR" = "systemd" ]; then
     # 注意: 不停用也不再清空现有 iptables 规则，避免影响其他程序
 fi
 
-# 3. 生成独立流量统计脚本 (/root/netstat.sh)
+# 2.9 提前创建运行时脚本目录（check/reset/netstat 三个脚本统一收拢于此）
+mkdir -p "$SCRIPT_DIR"
+
+# 3. 生成独立流量统计脚本 ($SCRIPT_DIR/netstat.sh)
 #    算法与哪吒探针(nezha)一致：直接读 /proc/net/dev，排除虚拟网卡(lo/docker/veth/br-等)，
 #    对剩余全部物理网卡的 RX(下行)/TX(上行) 分别求和作为"当前累计"；
 #    通过与上次快照求差得到增量，分别累加到当月 RX/TX 累计
 #   （快照回绕/服务器重启时增量归零重新累计），彻底摆脱对 vnstatd 的依赖。
 #    供下方 heredoc 展开的绝对路径（check/reset 内统计调用统一用此变量）
-NETSTAT_BIN="/root/netstat.sh"
-echo "--> 生成独立流量统计脚本 /root/netstat.sh..."
-cat > /root/netstat.sh <<'NETSTAT'
+NETSTAT_BIN="$SCRIPT_DIR/netstat.sh"
+echo "--> 生成独立流量统计脚本 $SCRIPT_DIR/netstat.sh..."
+cat > "$SCRIPT_DIR/netstat.sh" <<'NETSTAT'
 #!/bin/bash
 # netstat.sh - 独立流量统计 (nezha 式 /proc/net/dev + 月度增量, 上下行分开)
-# 用法:
-#   /root/netstat.sh            输出当月累计字节: "上行(TX) 下行(RX)" (空格分隔, 两值)
-#   /root/netstat.sh --out       只输出当月上行累计 (单值)
-#   /root/netstat.sh --in       只输出当月下行累计 (单值)
-#   /root/netstat.sh --reset    清零当月累计 (每月1号由 reset_network.sh 调用)
-#   /root/netstat.sh --current  输出当前网卡累计快照 (调试用)
+# 用法（与 SCRIPT_DIR 同目录，默认 /root/traffic_routing/netstat.sh）:
+#   netstat.sh            输出当月累计字节: "上行(TX) 下行(RX)" (空格分隔, 两值)
+#   netstat.sh --out       只输出当月上行累计 (单值)
+#   netstat.sh --in       只输出当月下行累计 (单值)
+#   netstat.sh --reset    清零当月累计 (每月1号由 reset_network.sh 调用)
+#   netstat.sh --current  输出当前网卡累计快照 (调试用)
 #   每次调用都是"采样"：会推进快照、更新/持久化状态。状态文件: /var/lib/traffic_monitor/netcount
 
 set -u
@@ -668,9 +748,9 @@ case "${1:-}" in
     *)    echo "$MONTH_TX $MONTH_RX" ;;
 esac
 NETSTAT
-chmod +x /root/netstat.sh
+chmod +x "$SCRIPT_DIR/netstat.sh"
 # 立即初始化快照 (--reset：当月累计=0、快照=当前累计；此后每5分钟增量累计)
-/root/netstat.sh --reset >/dev/null 2>&1 || true
+"$SCRIPT_DIR/netstat.sh" --reset >/dev/null 2>&1 || true
 echo "--> 流量统计脚本已生成并初始化 (独立于 vnstat)。"
 
 # 3.5 生成运行时配置文件与密钥
@@ -678,18 +758,19 @@ gen_key
 write_conf
 echo "--> 运行时配置已写入 ${CONF_FILE}（密钥 ${NETMON_KEY}，TG 凭据已加密）。"
 
-# 4. 生成监控脚本 (/root/check_traffic.sh)
+# 4. 生成监控脚本 ($SCRIPT_DIR/check_traffic.sh)
 #    配置统一从 CONF_FILE 读取（改配置不改脚本）。
-echo "--> 生成监控脚本 /root/check_traffic.sh..."
-cat > /root/check_traffic.sh <<EOF
+echo "--> 生成监控脚本 $SCRIPT_DIR/check_traffic.sh..."
+cat > "$SCRIPT_DIR/check_traffic.sh" <<EOF
 #!/bin/bash
 
 # 强制使用标准区域设置
 export LC_ALL=C
 
-# 配置来源：改 /etc/netMonitor.conf 即生效（无需重部署）
+# 配置来源：改 conf 文件即生效（无需重部署）；SCRIPT_DIR 部署期 baked，check 与 netstat 同目录
 CONF_FILE="$CONF_FILE"
 NETMON_KEY="$NETMON_KEY"
+SCRIPT_DIR="$SCRIPT_DIR"
 LOG_FILE="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
 
@@ -724,7 +805,10 @@ command -v iptables  >/dev/null 2>&1 || HAS_V4=0
 command -v ip6tables >/dev/null 2>&1 || HAS_V6=0
 
 [ -n "\$INTERFACE" ] || { echo "错误：配置中缺少 INTERFACE" >&2; exit 1; }
-[ -n "\$LIMIT" ] || LIMIT=180
+# LIMIT 无默认值：空/0/-1 = 无限制（check 内跳过封网判定）；只在 >0 时比较
+if [ -z "\${LIMIT:-}" ]; then
+    LIMIT=""
+fi
 
 # TG 通知开关 (两者均非空才启用；配置未填 TG 则恒为 0)
 TG_ON=0
@@ -846,13 +930,13 @@ tg_send() {
 
 # ==========================================
 # 读取当月上下行累计 (调用一次 netstat.sh = 一次采样)
-# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量, 上下行分开)
+# 数据来源: 独立统计脚本 $SCRIPT_DIR/netstat.sh (nezha 式 /proc/net/dev + 月度增量, 上下行分开)
 # 注意: netstat.sh 每次调用都会推进快照，必须只调用一次并把结果复用，
 #       否则同一 cron 周期多次采样会导致累计翻倍。
 # 设置: MONTH_TX / MONTH_RX (字节), 并按 STAT_MODE 计算 BAL_BYTES (超限判断口径)
 #   STAT_MODE: out=出站 in=入站 max=取大 min=取小 sum=总和
 # ==========================================
-NETSTAT_BIN="/root/netstat.sh"
+NETSTAT_BIN="\$SCRIPT_DIR/netstat.sh"
 read_traffic() {
     local out
     out=\$("$NETSTAT_BIN" 2>/dev/null)
@@ -952,7 +1036,8 @@ if [ "\$MONTH" != "\$CUR_MONTH" ]; then
     RESTORED_TIME=""
 fi
 
-# 保存当月状态到文件
+# 保存当月状态到文件（附带本次判定的快照：流量口径/上限/上下行/计费流量，
+# 看 state 一眼可知：这个月用了多少、是否断网、口径和上限是多少）
 save_state() {
     mkdir -p "\$(dirname "\$STATE_FILE")"
     cat > "\$STATE_FILE" <<STATE_EOF
@@ -961,10 +1046,22 @@ STATE=\$STATE
 BLOCKED_TIME="\$BLOCKED_TIME"
 BLOCKED_TX="\$BLOCKED_TX"
 RESTORED_TIME="\$RESTORED_TIME"
+USED_STAT_MODE=\$STAT_MODE
+USED_LIMIT=\$LIMIT
+USED_TX=\$MONTH_TX
+USED_RX=\$MONTH_RX
+USED_BAL=\$BAL_BYTES
 STATE_EOF
 }
 
 # 检查是否超限 (用字节级精度比较, 支持 GB 小数上限如 0.001=1MB, 避免 BAL_GB 浮点取整误判)
+# LIMIT 语义: 未设置/空/0/-1 = 无限制（跳过封网判定）；>0 才做超限比较
+if [ -z "\${LIMIT:-}" ] || [ "\$LIMIT" = "0" ] || [ "\$LIMIT" = "-1" ]; then
+    echo "状态: [无限制] LIMIT 未设置或为 0/-1，本次不做超限判定。"
+    log "LIMIT 未设置(0/-1=无限制)，跳过超限判定 (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))。"
+    STATE=normal
+    save_state
+else
 LIMIT_BYTES=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc)
 if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
     echo "状态: [警告] 流量已超限，正在禁止出站..."
@@ -1057,21 +1154,24 @@ else
         save_state
         log "检测到流量回落，状态恢复正常。"
     else
+        save_state
         log "流量正常。"
     fi
 fi
+fi
 EOF
 
-# 5. 生成重置脚本 (/root/reset_network.sh)
+# 5. 生成重置脚本 ($SCRIPT_DIR/reset_network.sh)
 #    配置同样从 CONF_FILE 读取。
-echo "--> 生成重置脚本 /root/reset_network.sh..."
-cat > /root/reset_network.sh <<EOF
+echo "--> 生成重置脚本 $SCRIPT_DIR/reset_network.sh..."
+cat > "$SCRIPT_DIR/reset_network.sh" <<EOF
 #!/bin/bash
 
 CONF_FILE="$CONF_FILE"
 NETMON_KEY="$NETMON_KEY"
+SCRIPT_DIR="$SCRIPT_DIR"
 RESET_LOG="/var/log/network_reset.log"
-TRAFFIC_LOG="/var/log/traffic_monitor.log"
+LOG_FILE="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
 # 上个月流量月度档案 (长期留存): 每次月度重置时把上月最终上下行追加一行, 一行一月
 ARCHIVE_FILE="/var/lib/traffic_monitor/archive"
@@ -1099,13 +1199,19 @@ TELEGRAM_CHAT_ID="\$(dec_tg "\$TELEGRAM_CHAT_ID_ENC")"
 PLATFORM="\${PLATFORM:-gcp}"
 INTERFACE="\${INTERFACE:-}"
 [ -n "\$INTERFACE" ] || { echo "错误：配置中缺少 INTERFACE" >&2; exit 1; }
-LIMIT="\${LIMIT:-180}"
+# LIMIT 无默认值：空/0/-1 = 无限制；reset 侧不做封网比较，只原样归档/展示
+LIMIT="\${LIMIT:-}"
 DNS_SERVERS="\${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
 # 地址族标记：缺失时按命令可用性兜底
 HAS_V4="\${HAS_V4:-1}"
 HAS_V6="\${HAS_V6:-1}"
 command -v iptables  >/dev/null 2>&1 || HAS_V4=0
 command -v ip6tables >/dev/null 2>&1 || HAS_V6=0
+# 日志保留天数：重置时只保留最近 N 天，删除更早的行（0/-1=保留全部）
+LOG_RETENTION_DAYS="\${LOG_RETENTION_DAYS:-7}"
+case "\$LOG_RETENTION_DAYS" in
+    ''|*[!0-9-]*|-) LOG_RETENTION_DAYS=7 ;;
+esac
 
 # TG 通知开关 (两者均非空才启用)
 TG_ON=0
@@ -1189,11 +1295,12 @@ get_ip_and_loc() {
 }
 
 # 采样当月上下行累计 (返回 "上行(TX) 下行(RX)" 两值)
-# 数据来源: 独立统计脚本 /root/netstat.sh (nezha 式 /proc/net/dev + 月度增量)
+# 数据来源: 独立统计脚本 netstat.sh (与 check 共用同一份, nezha 式 /proc/net/dev + 月度增量)
 # 注意: 必须在 reset 前调用一次 (采样当月最终值), reset 会清零计数。
+NETSTAT_BIN="\$SCRIPT_DIR/netstat.sh"
 read_traffic_last() {
     local out
-    out=\$("/root/netstat.sh" 2>/dev/null)
+    out=\$("$NETSTAT_BIN" 2>/dev/null)
     LAST_MONTH_TX=\${out%% *}
     LAST_MONTH_RX=\${out##* }
     if ! [[ "\$LAST_MONTH_TX" =~ ^[0-9]+$ ]]; then LAST_MONTH_TX=0; fi
@@ -1244,12 +1351,19 @@ CUR_MONTH=\$(date '+%Y-%m')
 [ -z "\$STATE" ] && STATE=normal
 [ -z "\$MONTH" ] && MONTH="\$CUR_MONTH"
 
-# 1. 删除旧的流量监控日志
-if [ -f "\$TRAFFIC_LOG" ]; then
-    rm -f "\$TRAFFIC_LOG"
-    log "已删除旧的流量监控日志: \$TRAFFIC_LOG"
+# 1. 清理旧日志：只保留最近 LOG_RETENTION_DAYS 天的日志行（写入由 check_traffic.sh 的 log() 负责）
+if [ -f "\$LOG_FILE" ]; then
+    if [ "\$LOG_RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
+        # 行首为 ISO 日期 (YYYY-MM-DD)，按字符串比较截断；GNU/BusyBox date 均支持 -d
+        CUTOFF=\$(date -d "\${LOG_RETENTION_DAYS} days ago" '+%Y-%m-%d' 2>/dev/null)
+        [ -z "\$CUTOFF" ] && CUTOFF=\$(date '+%Y-%m-%d')
+        awk -v c="\$CUTOFF" 'substr(\$0,1,10) >= c' "\$LOG_FILE" > "\$LOG_FILE.tmp" 2>/dev/null && mv "\$LOG_FILE.tmp" "\$LOG_FILE"
+        log "流量监控日志已清理，保留最近 \${LOG_RETENTION_DAYS} 天 (截断点 \$CUTOFF)：\$LOG_FILE"
+    else
+        log "日志保留策略为保留全部 (LOG_RETENTION_DAYS=\$LOG_RETENTION_DAYS)，不清理 \$LOG_FILE。"
+    fi
 else
-    log "流量监控日志不存在，无需删除。"
+    log "流量监控日志不存在，无需清理。"
 fi
 
 # 2. 重置防火墙规则 (IPv4 + IPv6)
@@ -1292,7 +1406,7 @@ fi
 if [ "\$LAST_MONTH_TX" -gt 0 ] 2>/dev/null || [ "\$LAST_MONTH_RX" -gt 0 ] 2>/dev/null; then
     log "上个月流量: 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX")"
 fi
-/root/netstat.sh --reset >/dev/null 2>&1 || true
+"$NETSTAT_BIN" --reset >/dev/null 2>&1 || true
 log "流量统计已重置 (netstat.sh 当月累计清零)。"
 
 # 4. 网络恢复后发送 TG 通知 (仅当 TG 启用且上月处于断网状态时发送一次)
@@ -1306,9 +1420,15 @@ if [ "\$STATE" = "blocked" ] && [ "\$TG_ON" = "1" ]; then
 fi
 
 # 更新状态文件: 恢复 -> normal，记录恢复时间，进入新月份周期
+# 同步落盘快照字段（口径/上限/重置后清零的当月上下行），保证 state 自包含可查
 STATE=normal
 MONTH="\$CUR_MONTH"
 RESTORED_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
+USED_STAT_MODE="\$STAT_MODE"
+USED_LIMIT="\$LIMIT"
+USED_TX=0
+USED_RX=0
+USED_BAL=0
 mkdir -p "\$(dirname "\$STATE_FILE")"
 cat > "\$STATE_FILE" <<STATE_EOF
 MONTH=\$MONTH
@@ -1316,6 +1436,11 @@ STATE=\$STATE
 BLOCKED_TIME="\$BLOCKED_TIME"
 BLOCKED_TX="\$BLOCKED_TX"
 RESTORED_TIME="\$RESTORED_TIME"
+USED_STAT_MODE=\$USED_STAT_MODE
+USED_LIMIT=\$USED_LIMIT
+USED_TX=\$USED_TX
+USED_RX=\$USED_RX
+USED_BAL=\$USED_BAL
 STATE_EOF
 
 if [ "\$NEED_RESTORE" -eq 1 ]; then
@@ -1357,22 +1482,22 @@ fi
 EOF
 
 # 6. 赋予执行权限
-chmod +x /root/check_traffic.sh
-chmod +x /root/reset_network.sh
+chmod +x "$SCRIPT_DIR/check_traffic.sh"
+chmod +x "$SCRIPT_DIR/reset_network.sh"
 
 # 7. 设置定时任务
 echo "--> 更新 Crontab 定时任务..."
 crontab -l > /tmp/cron_bk 2>/dev/null
 
-# 清理旧任务，防止重复
+# 清理旧任务，防止重复（含旧版 /root 直放路径的残留）
 sed -i '/check_traffic.sh/d' /tmp/cron_bk
 sed -i '/reset_network.sh/d' /tmp/cron_bk
 
 # 添加新任务
 # 每5分钟检查一次流量
-echo "*/5 * * * * /root/check_traffic.sh" >> /tmp/cron_bk
+echo "*/5 * * * * $SCRIPT_DIR/check_traffic.sh" >> /tmp/cron_bk
 # 每月1号 00:00 重置网络和日志
-echo "0 0 1 * * /root/reset_network.sh" >> /tmp/cron_bk
+echo "0 0 1 * * $SCRIPT_DIR/reset_network.sh" >> /tmp/cron_bk
 
 crontab /tmp/cron_bk
 rm /tmp/cron_bk
@@ -1387,8 +1512,9 @@ echo "=========================================="
 echo " 安装完成！($PLATFORM)"
 echo "=========================================="
 echo "您可以手动运行以下命令查看精确流量："
-echo "  bash /root/check_traffic.sh"
+echo "  bash $SCRIPT_DIR/check_traffic.sh"
 echo ""
+echo "运行时脚本目录   : $SCRIPT_DIR (check/reset/netstat 统一收拢于此)"
 echo "运行时配置文件   : $CONF_FILE (0600，请勿手改；改动请用子命令)"
 echo "TG 密钥文件      : $NETMON_KEY (0600，丢失后凭据不可恢复)"
 echo ""
@@ -1397,7 +1523,7 @@ echo "  bash $0 edit       # 交互式菜单：修改平台/上限/端口/DNS/�
 echo "  bash $0 config     # 查看当前配置 (TG 凭据掩码显示)"
 echo "  bash $0 set-tg     # 换 TG: TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash $0 set-tg"
 echo "  bash $0 clear-tg   # 停用并清除 TG 凭据"
-echo "  bash /root/check_traffic.sh   # 手动查看流量"
+echo "  bash $SCRIPT_DIR/check_traffic.sh   # 手动查看流量"
 echo "=========================================="
 echo "当前配置："
 echo "  平台       : $PLATFORM"
@@ -1412,3 +1538,44 @@ else
     echo "              启用: TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash $0"
 fi
 echo "=========================================="
+}
+
+# ---------------- 入口分派（main） ----------------
+main() {
+    case "${1:-}" in
+        "" | menu)
+            main_menu
+            ;;
+        req | install)
+            do_install
+            ;;
+        set-tg)
+            tg_set
+            ;;
+        clear-tg)
+            tg_clear
+            ;;
+        config)
+            config_show
+            ;;
+        edit)
+            config_edit
+            ;;
+        del | un)
+            uninstall
+            ;;
+        -h | --help | help)
+            print_usage
+            ;;
+        *)
+            echo "未知命令：${1}" >&2
+            print_usage
+            exit 1
+            ;;
+    esac
+}
+
+# 测试钩子：NETMON_TEST_MODE=1 时只 source 函数定义（供 tests/smoke-netmon.sh），不进入 main
+if [ "${NETMON_TEST_MODE:-0}" != "1" ]; then
+    main "$@"
+fi

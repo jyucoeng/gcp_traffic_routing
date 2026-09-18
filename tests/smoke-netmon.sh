@@ -29,19 +29,9 @@ trap 'rm -rf "${TMP}"' EXIT
 export NETMON_TEST_MODE=1
 source "${SRC}/netMonitor/traffic_ctrl.sh"
 
-# ---------- 纯函数：resolve_limit ----------
-assert_eq "$(PLATFORM=gcp    LIMIT=          resolve_limit)" "180"  "默认平台 gcp 限额 180"
-assert_eq "$(PLATFORM=oracle LIMIT=          resolve_limit)" "9216" "oracle 限额 9216"
-assert_eq "$(PLATFORM=Oracle LIMIT=          resolve_limit)" "9216" "Oracle 大小写不敏感"
-assert_eq "$(PLATFORM=ORACLE LIMIT=          resolve_limit)" "9216" "ORACLE 大写匹配"
-assert_eq "$(PLATFORM=甲骨文 LIMIT=          resolve_limit)" "9216" "甲骨文中文平台名"
-assert_eq "$(PLATFORM=oracle-arm LIMIT=      resolve_limit)" "9216" "平台名含 oracle 子串"
-assert_eq "$(PLATFORM=aws    LIMIT=1024      resolve_limit)" "1024" "手动 LIMIT 优先"
-assert_eq "$(PLATFORM=gcp    LIMIT=999       resolve_limit)" "999"  "gcp 手动覆盖"
-assert_eq "$(PLATFORM=custom LIMIT=          resolve_limit)" "180"  "自定义平台未给 LIMIT 默认 180"
-
-# source 时默认值已按 PLATFORM 展开（上面 source 无 PLATFORM=oracle，ANSI 检查 gcp 默认）
-assert_eq "${LIMIT:-}" "180" "source 后默认 LIMIT=180"
+# ---------- LIMIT 无默认值：未设置即为空，部署流程直接报错 ----------
+assert_eq "${LIMIT:-}" "" "source 后默认 LIMIT 为空（无平台推断默认值）"
+assert_false 'command -v resolve_limit >/dev/null' "resolve_limit 函数已删除"
 
 # ---------- 纯函数：resolve_dns ----------
 assert_eq "$(HAS_V4=0 HAS_V6=1 resolve_dns)" "2001:4860:4860::8888 2001:4860:4860::8844" "纯 IPv6 用 Google IPv6 DNS"
