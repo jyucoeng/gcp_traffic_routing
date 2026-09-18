@@ -13,7 +13,7 @@ REPO_NAME="gcp_traffic_routing"       # 你的仓库名（保持与仓库 URL �
 PROJECT_VERSION="v0.1.0"              # 发布版本号（与 VERSION 文件一致）
 PACKAGE_NAME="${REPO_NAME}-${PROJECT_VERSION}.tar.gz"   # 由上方常量派生，无需手改
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256="3fd17778b3305637d82ec2cfd9d0eb91879780966ef2d51d84c074f9c38c2e94"
+PACKAGE_SHA256="8ea0050a2974c6c272a67f4fb08d88bb981f0a7219176287472c3a50d24f3e42"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"

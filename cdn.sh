@@ -16,8 +16,8 @@ set -eEuo pipefail
 #
 # 命令:
 #   cdn              同 install（TTY 下显示交互菜单：1安装 2设置分流节点 3全量卸载 4退出）
-#   cdn install      安装/更新 dae + cdnip geoip 数据库，并生成配置
-#   cdn update       强制重下 dae 二进制与 geoip 数据库，然后重新 apply
+#   cdn install      安装/更新 dae + cdnip geoip 数据库 + 在线 CDN 网段缓存，并生成配置
+#   cdn update       强制重下 dae 二进制与 geoip 数据库 + CDN 网段缓存，然后重新 apply
 #   cdn add <链接...>      添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），自动 apply
 #   cdn add-sub <url> [标签]  添加订阅，自动 apply
 #   cdn del <匹配>         按序号(1 起)或关键字删除节点，自动 apply
@@ -39,6 +39,9 @@ set -eEuo pipefail
 #   cdn_geoip_url     自定义 geoip.dat 下载地址（默认社区 cdnip 版）
 #   cdn_geoip_sha_url 自定义 sha256 校验文件地址（默认 "${cdn_geoip_url}.sha256sum"）
 #   cdn_skip_geo      跳过 geoip 下载（仅当你已自行放置 /usr/local/share/dae/geoip.dat）
+#   cdn_cdnip_base    在线 CDN 网段清单 base URL（默认 jyucoeng/gcp_traffic_routing main）
+#   cdn_cdnip_files   清单文件名列表（可覆盖，空格分隔）
+#   cdn_skip_cdnip    跳过 CDN 网段清单下载（降级为仅 geoip 判定）
 #   cdn_force         强制重装，跳过"已存在"判断（cdn update 内部使用）
 #   CDN_DAE_VERSION_URL 自定义 dae 版本查询接口（默认 GitHub API）
 #   CDN_DIR           工作目录（默认 /usr/local/etc/cdn-manager；测试可覆盖）
@@ -68,6 +71,15 @@ DAE_ARCH_CANDIDATES=()
 CDN_GEOIP_URL_DEFAULT="https://github.com/fatekey/gcp_free/raw/master/geoip.dat"
 CDN_GEOIP_SHA_DEFAULT="${CDN_GEOIP_URL_DEFAULT}.sha256sum"
 CDN_GEOIP_MIRROR="https://cdn.jsdelivr.net/gh/fatekey/gcp_free@master/geoip.dat"
+
+# 在线 CDN 网段 txt 清单（托管于 jyucoeng/gcp_traffic_routing 仓库，不会随意删除；
+# 不随本发布包分发，安装/更新时在线拉取）。对应 Cloudflare/Fastly/Akamai 的
+# v4+v6 官方网段，每行为一条逗号/换行分隔的 CIDR 列表。
+# render 时生成 dip(ipcidr(...)) 规则并置于 dip(geoip:cdnip) 之前：
+#   命中该缓存 -> 直接走 CDN 组；未命中 -> 继续查 geoip.dat(cdnip)。
+CDN_CDNIP_BASE="${CDN_CDNIP_BASE:-https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main}"
+CDN_CDNIP_FILES="${CDN_CDNIP_FILES:-1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastly-ipv6-2.txt 3-akamai_ipv6-64.txt 4-akamai-ip-255.txt 5-akamai-ip-113.txt}"
+CDN_CDNIP_CACHE="${CDN_CDNIP_CACHE:-${DAE_DATA_DIR}/cdnip.txt}"
 
 # 颜色输出（非 TTY 或 NO_COLOR 时禁用）
 supports_color() {
@@ -323,6 +335,78 @@ cdn_install_geoip() {
   cdn_print_ok "geoip.dat（cdnip 标签）已安装：${DAE_GEOIP}"
 }
 
+# 下载并缓存在线 CDN 网段清单（逗号/换行分隔 CIDR，含 v4+v6），
+# 供 render 生成 ipcidr 规则作为 geoip.dat 之前的第一层命中判定。
+# 失败仅告警不中断：降级为纯 geoip(cdnip) 判定。
+cdn_fetch_cdnip() {
+  local f url tmp cidr raw="" out=()
+  if [ "${cdn_skip_cdnip:-0}" = "1" ]; then
+    cdn_print_info "cdn_skip_cdnip=1，跳过 CDN 网段清单下载。"
+    return 0
+  fi
+  if [ "${cdn_force:-0}" != "1" ] && [ -s "${CDN_CDNIP_CACHE}" ]; then
+    cdn_print_info "CDN 网段缓存已存在（$(wc -l <"${CDN_CDNIP_CACHE}") 条）：${CDN_CDNIP_CACHE}"
+    return 0
+  fi
+  [ "${CDN_TEST_MODE:-0}" = "1" ] && {
+    cdn_print_info "测试模式：跳过 CDN 网段清单在线下载。"
+    return 0
+  }
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "${tmp:-}"' EXIT
+  for f in ${CDN_CDNIP_FILES}; do
+    url="${CDN_CDNIP_BASE}/${f}"
+    if download_file "${url}" "${tmp}/${f}" 2>/dev/null; then
+      raw="${raw} $(tr ',' '\n' <"${tmp}/${f}")"
+    else
+      cdn_print_warn "CDN 网段清单下载失败：${url}"
+    fi
+  done
+  trap - EXIT
+  rm -rf "${tmp}"
+  raw="$(printf '%s' "${raw}" | tr ' ' '\n' | awk 'NF{gsub(/^[ \t\r]+|[ \t\r]+$/, ""); print}')"
+  if [ -z "${raw}" ]; then
+    cdn_print_warn "未获取到任何 CDN 网段，降级为仅使用 geoip.dat（cdnip）判定。"
+    return 0
+  fi
+  while IFS= read -r cidr; do
+    [ -z "${cidr}" ] && continue
+    if printf '%s' "${cidr}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$|^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|12[0-8])$'; then
+      out+=("${cidr}")
+    else
+      cdn_print_warn "忽略非法网段：${cidr}"
+    fi
+  done <<<"${raw}"
+  [ "${#out[@]:-0}" -gt 0 ] || {
+    cdn_print_warn "CDN 网段清单全部非法，降级为仅使用 geoip.dat（cdnip）判定。"
+    return 0
+  }
+  mkdir -p "$(dirname "${CDN_CDNIP_CACHE}")"
+  printf '%s\n' "${out[@]}" | sort -u >"${CDN_CDNIP_CACHE}"
+  cdn_print_ok "CDN 网段清单已缓存（$(wc -l <"${CDN_CDNIP_CACHE}") 条）：${CDN_CDNIP_CACHE}"
+}
+
+# 从缓存生成 dip(ipcidr(...)) 规则行（每行至多 25 条 CIDR），
+# 由 render 插入在 dip(geoip:cdnip) 之前：先命中缓存，未命中再查 geoip。
+cdn_ipcidr_rules() {
+  local group=() n=0 cidr
+  [ -s "${CDN_CDNIP_CACHE}" ] || cdn_fetch_cdnip >/dev/null 2>&1 || true
+  [ -s "${CDN_CDNIP_CACHE}" ] || return 0
+  while IFS= read -r cidr; do
+    [ -z "${cidr}" ] && continue
+    printf '%s' "${cidr}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$|^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|12[0-8])$' || continue
+    group+=("${cidr}")
+    n=$((n + 1))
+    if [ "${n}" -ge 25 ]; then
+      printf '    dip(ipcidr(%s)) -> my_group\n' "$(IFS=,; printf '%s' "${group[*]}")"
+      group=() n=0
+    fi
+  done <"${CDN_CDNIP_CACHE}"
+  if [ "${n}" -gt 0 ]; then
+    printf '    dip(ipcidr(%s)) -> my_group\n' "$(IFS=,; printf '%s' "${group[*]}")"
+  fi
+}
+
 # 自动探测 LAN 接口：存在 docker 网桥（docker0/br-*，参考实现同款）时绑定，否则留空
 cdn_detect_lan_iface() {
   local dir oper
@@ -424,6 +508,8 @@ cdn_render_config() {
   printf '}\n'
   printf 'routing {\n'
   printf '    pname(NetworkManager) -> direct\n'
+  printf '    # 第一层：在线 CDN 网段缓存命中即走 CDN 组（未命中再查 geoip.dat）\n'
+  cdn_ipcidr_rules
   printf '    dip(geoip:cdnip) -> my_group\n'
   printf '\n'
   printf '    fallback: direct\n'
@@ -781,7 +867,7 @@ cdn_apply() {
   fi
   cdn_create_service
   cdn_restart_service
-  cdn_print_ok "CDN 分流配置已生效（dip(geoip:cdnip) -> my_group，其余直连）。"
+  cdn_print_ok "CDN 分流配置已生效（cdnip 网段缓存 + dip(geoip:cdnip) -> my_group，其余直连）。"
 }
 
 cdn_install() {
@@ -792,12 +878,13 @@ cdn_install() {
   cdn_arch_candidates
   cdn_install_binary
   cdn_install_geoip
+  cdn_fetch_cdnip
   cdn_env_preload
   if [ -f "${CDN_NODES}" ] || [ -f "${CDN_SUBS}" ]; then
     cdn_apply
   else
     cdn_write_config || true
-    cdn_print_info "已就绪。接下来用 cdn add 添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），全部流量将按 dip(geoip:cdnip) 分流。"
+    cdn_print_info "已就绪。接下来用 cdn add 添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），流量将按 CDN 网段缓存 + dip(geoip:cdnip) 分流。"
     cdn_print_info "示例: cdn add 'vless://uuid@node.example.com:443?...' 'trojan://pass@node2.example.com:443'"
   fi
 }
@@ -809,6 +896,7 @@ cdn_update() {
   cdn_arch_candidates
   cdn_force=1 cdn_install_binary
   cdn_force=1 cdn_install_geoip
+  cdn_force=1 cdn_fetch_cdnip
   cdn_create_service
   if [ -f "${CDN_NODES}" ] || [ -f "${CDN_SUBS}" ]; then
     cdn_apply
@@ -857,7 +945,7 @@ cdn_uninstall() {
   rm -f "${DAE_BIN}"
   rm -rf "${DAE_DATA_DIR}" /usr/local/etc/dae
   rm -rf "${CDN_DIR}"
-  cdn_print_ok "CDN 分流管理器已全量卸载（dae 服务/二进制/geoip/配置/节点）。"
+  cdn_print_ok "CDN 分流管理器已全量卸载（dae 服务/二进制/geoip/配置/节点/CDN 网段缓存）。"
 }
 
 cdn_menu_nodes() {
@@ -879,7 +967,7 @@ cdn_menu_nodes() {
 
 cdn_menu_uninstall() {
   local ans self
-  cdn_print_warn "将彻底删除：dae 服务/二进制 + geoip + 配置 + 节点 + 本管理器脚本（${0}）。"
+  cdn_print_warn "将彻底删除：dae 服务/二进制 + geoip + CDN 网段缓存 + 配置 + 节点 + 本管理器脚本（${0}）。"
   read -r -p "确认全量卸载？(y/N): " ans || ans=""
   case "${ans:-}" in
   y | Y) ;;
@@ -900,7 +988,7 @@ cdn_menu() {
   while :; do
     printf '\n%s\n' "${PROJECT_NAME} 管理器（dae CDN 分流）"
     printf '%s\n'   "=============================="
-    printf '1) 安装（dae + geoip + 配置）\n'
+    printf '1) 安装（dae + geoip + CDN 网段缓存 + 配置）\n'
     printf '2) 设置分流节点（vless/vmess/trojan/hysteria2/tuic/anytls）\n'
     printf '3) 全量卸载\n'
     printf '4) 退出\n'
@@ -937,9 +1025,9 @@ print_usage() {
 
 命令:
   (无参数)          TTY 下进入交互菜单；非终端下同 install
-  install           安装/更新 dae + cdnip geoip 数据库并生成配置
+  install           安装/更新 dae + cdnip geoip 数据库 + CDN 网段缓存并生成配置
   menu              交互菜单：安装 / 设置分流节点 / 全量卸载 / 退出
-  update              强制重下 dae 二进制与 geoip 数据库，然后重新 apply
+  update              强制重下 dae 二进制与 geoip 数据库 + CDN 网段缓存，然后重新 apply
   add <vless://…> [<trojan://…> …]   添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），自动 apply
   add-sub <url> [标签]  添加订阅，自动 apply
   del <序号|关键字>     删除节点（按 cdn list 中的序号或链接关键字）
@@ -958,6 +1046,8 @@ print_usage() {
   cdn_policy          节点选择策略（默认 min）
   cdn_geoip_url / cdn_geoip_sha_url   自定义 geoip.dat 与校验地址
   cdn_skip_geo        跳过 geoip 下载（需自备 /usr/local/share/dae/geoip.dat）
+  cdn_cdnip_base / cdn_cdnip_files    在线 CDN 网段清单地址与文件名（默认 jyucoeng/gcp_traffic_routing main）
+  cdn_skip_cdnip      跳过 CDN 网段缓存（降级为仅 geoip 判定）
 EOF
 }
 

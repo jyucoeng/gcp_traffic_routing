@@ -26,8 +26,13 @@ trap 'rm -rf "${TMP}"' EXIT
 export CDN_TEST_MODE=1
 export CDN_DIR="${TMP}/etc/cdn-manager"
 export CDN_CONF="${TMP}/etc/dae/config.dae"
+# 测试模式：CDN 网段缓存写入临时目录，不触发在线下载
+export CDN_CDNIP_CACHE="${TMP}/cdnip.txt"
 
 source "${SRC}/cdn.sh"
+
+# 预置 CDN 网段缓存 fixture（含一条非法条目，用于断言过滤）
+printf '104.16.0.0/13\n2400:cb00::/32\n104.24.0.0/14\nnot-a-cidr\n2.2.2.2/24\n' >"${CDN_CDNIP_CACHE}"
 
 V="vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@1.2.3.4:443?encryption=none&security=tls#Name"
 T="trojan://password123456@5.6.7.8:443#troj"
@@ -96,6 +101,25 @@ if [[ "${OUT}" == *"fallback: direct"* ]]; then
   ok "render 其余流量直连（fallback: direct）"
 else
   bad "render 缺少 fallback: direct"
+fi
+# ---------- cdn render：CDN 网段缓存（ipcidr）优先于 geoip ----------
+# 先命中缓存走 CDN 组，未命中再查 dip(geoip:cdnip)；规则顺序必须满足 ipcidr 在 geoip 之前
+if [[ "${OUT}" == *"dip(ipcidr(104.16.0.0/13,2400:cb00::/32,104.24.0.0/14,2.2.2.2/24)) -> my_group"* ]]; then
+  ok "render 将 CDN 网段缓存渲染为 ipcidr() 子网匹配规则（非法条目被过滤）"
+else
+  bad "render 未输出 ipcidr 缓存规则或子网顺序异常"
+fi
+if [[ "${OUT}" == *"not-a-cidr"* ]]; then
+  bad "render 混入了非法条目（应被过滤）"
+else
+  ok "render 非法条目被过滤"
+fi
+first_ipcidr="$(printf '%s\n' "${OUT}" | grep -n 'dip(ipcidr' | head -n1 | cut -d: -f1)"
+first_geoip="$(printf '%s\n' "${OUT}" | grep -n 'dip(geoip:cdnip)' | head -n1 | cut -d: -f1)"
+if [ -n "${first_ipcidr}" ] && [ -n "${first_geoip}" ] && [ "${first_ipcidr}" -lt "${first_geoip}" ]; then
+  ok "ipcidr 缓存规则位于 geoip 之前（先缓存命中，未命中再查 geoip）"
+else
+  bad "规则顺序异常：ipcidr=${first_ipcidr:-无} geoip=${first_geoip:-无}"
 fi
 if [[ "${OUT}" == *"policy: min"* ]]; then
   ok "render 默认策略 min"
