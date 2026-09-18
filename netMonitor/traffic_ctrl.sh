@@ -156,7 +156,8 @@ uninstall() {
     [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
 
     # 4. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
-    rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/netcount 2>/dev/null || true
+    # 卸载只清除本月状态(state)；本月流量计数(netcount)保留 -- 覆盖式重装后继续累计当月实时流量
+    rm -f /var/lib/traffic_monitor/state 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
     rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
 
@@ -1400,6 +1401,34 @@ if [ -n "\$ARCH_MONTH" ] && ! grep -q "^[[:space:]]*\$ARCH_MONTH[[:space:]]" "\$
     # 字段: 月份 TX=上月上流 RX=上月下流 mode=计费口径 blocked=上月是否触发封网(blocked=触发 normal=未触发)
     printf '%s TX=%s RX=%s mode=%s blocked=%s\n' "\$ARCH_MONTH" "\$LAST_MONTH_TX" "\$LAST_MONTH_RX" "\$STAT_MODE" "\$STATE" >> "\$ARCHIVE_FILE"
     log "已归档上个月流量到月度档案: \$ARCH_MONTH 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX") (口径 \$STAT_MODE, 封网 \$STATE)"
+
+    # --- 3.1.2 总计流量 (从开始到现在 各类流量总计, 长期累计一笔, 卸载不清, 永不裁剪) ---
+    #    字段: 月份 TX=上行总计 RX=下行总计 mode=计费口径
+    GRAND_TOTAL_FILE="/var/lib/traffic_monitor/grand_total"
+    if [ -n "\$ARCH_MONTH" ] && ! grep -q "^[[:space:]]*\$ARCH_MONTH[[:space:]]" "\$GRAND_TOTAL_FILE" 2>/dev/null; then
+        mkdir -p "\$(dirname "\$GRAND_TOTAL_FILE")"
+        OLD_GD_TX="\$(sed -n 's/^TOTAL_TX=//p' "\$GRAND_TOTAL_FILE" 2>/dev/null | tail -n1)"
+        OLD_GD_RX="\$(sed -n 's/^TOTAL_RX=//p' "\$GRAND_TOTAL_FILE" 2>/dev/null | tail -n1)"
+        OLD_GD_TX="\${OLD_GD_TX:-0}"; OLD_GD_RX="\${OLD_GD_RX:-0}"
+        NEW_GD_TX=\$((OLD_GD_TX + LAST_MONTH_TX))
+        NEW_GD_RX=\$((OLD_GD_RX + LAST_MONTH_RX))
+        # 月度快照也归档 netcount (本月数据按年月留存, 保留近12月)
+        NETCOUNT_SNAP="/var/lib/traffic_monitor/netcount_\$ARCH_MONTH"
+        if [ -f /var/lib/traffic_monitor/netcount ] && [ ! -f "\$NETCOUNT_SNAP" ]; then
+            cp -p /var/lib/traffic_monitor/netcount "\$NETCOUNT_SNAP"
+            log "已归档本月流量快照: \$ARCH_MONTH"
+        fi
+        # 保留近12月: 只留最近12个 netcount_* 月度快照 (先裁再加新, 保证同月只留一份; archive/总计 长期留存不在此列)
+        if command -v ls >/dev/null 2>&1; then
+            ls -1 /var/lib/traffic_monitor/netcount_????-?? 2>/dev/null | sort | head -n -12 | while read -r _old; do
+                [ -n "$_old" ] && rm -f "$_old" 2>/dev/null || true
+            done
+        fi
+        printf 'TOTAL_TX=%s TOTAL_RX=%s MONTH=%s\n' "\$NEW_GD_TX" "\$NEW_GD_RX" "\$ARCH_MONTH" > "\$GRAND_TOTAL_FILE"
+        log "总计流量已更新: 从开始到现在 上行 \$(format_traffic "\$NEW_GD_TX") / 下行 \$(format_traffic "\$NEW_GD_RX") (截至 \$ARCH_MONTH)"
+    else
+        log "总计流量本月已计入或月份无效，跳过。"
+    fi
 else
     log "上月流量档案已存在或月份无效，跳过归档。"
 fi
