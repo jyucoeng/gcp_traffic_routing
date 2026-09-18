@@ -454,7 +454,7 @@ main_menu() {
         echo " 3) 修改配置（交互菜单）"
         echo " 4) 设置/更换 TG 凭据"
         echo " 5) 停用 TG 通知（清除凭据）"
-        echo " 6) 卸载（保留密钥与月度档案；netcount 当月玉芬保留，覆盖式重装后继续累计）"
+        echo " 6) 卸载"
         echo " 0) 退出"
         echo "========================="
         printf "请选择: "
@@ -513,7 +513,7 @@ print_usage() {
   config           查看当前配置（TG 凭据掩码显示）
   set-tg           更换 TG 凭据：TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
   clear-tg         停用并清除 TG 凭据
-  del              卸载（保留密钥与月度档案；netcount 当月玉芬保留，覆盖式重装后继续累计）
+  del              卸载
   -h | --help | help  显示本帮助
 
 环境变量:
