@@ -680,9 +680,9 @@ current_counters() {
                 || iface ~ /^virbr/ || iface ~ /^tun/ || iface ~ /^tap/ || iface ~ /^vbox/ \
                 || iface ~ /^dummy/) next
             out += $10
-            in += $2
+            rxcnt += $2
         }
-        END { printf "%d %d\n", out+0, in+0 }
+        END { printf "%.0f %.0f\n", out+0, rxcnt+0 }
     ' /proc/net/dev
 }
 
@@ -1077,7 +1077,7 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
         # 超限时发送 TG 通知 (TG 启用时)
         if [ "\$TG_ON" = "1" ]; then
             IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
-            RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
+            RUN_TIME=\$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')   # TG 展示用北京时间 (busybox TZ=UTC-8 = UTC+8)
             # CPU 行 (仅 oracle 显示)
             CPU_LINE=""
             if is_oracle_platform; then
@@ -1445,7 +1445,7 @@ STATE_EOF
 
 if [ "\$NEED_RESTORE" -eq 1 ]; then
 IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
-    RUN_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
+    RUN_TIME=\$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')   # TG 展示用北京时间 (busybox TZ=UTC-8 = UTC+8)
     MONTH_TX=0
     MONTH_RX=0
     # 上个月(重置前周期)最终流量: 步骤3已采样 (LAST_MONTH_TX/RX)
