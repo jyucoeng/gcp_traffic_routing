@@ -698,6 +698,7 @@ print_usage() {
   check            查看流量（跑 check_traffic.sh：查当月上下行 + 超限判定）
   restore          恢复网络（跑 reset_network.sh：清封网 + 重置统计）
   update           脚本更新（从 GitHub 拉最新部署器，仅换文件不重装）
+  reset-notify     重置本月 TG 发送计数（删 notify 本月行，超限/恢复可重发）
   del              卸载
   -h | --help | help  显示本帮助
 
@@ -2060,6 +2061,9 @@ main() {
             ;;
         update | upgrade)
             menu_update
+            ;;
+        reset-notify)
+            tg_notify_reset
             ;;
         del | un)
             uninstall
