@@ -554,7 +554,11 @@ menu_install_ask() {
         _has_tg=0
     fi
     echo ""
-    echo "--- 安装参数确认（回车保留默认值）---"
+    if [ "$_mode" = "1" ]; then
+        echo "--- 全新安装参数（回车用默认值）---"
+    else
+        echo "--- 覆盖安装参数（回车保留现值）---"
+    fi
     printf "平台 PLATFORM [%s]: " "$_d_platform"; read -r v || return 1
     [ -n "$v" ] && PLATFORM="$v" || PLATFORM="$_d_platform"
     while :; do
@@ -565,17 +569,23 @@ menu_install_ask() {
             printf "流量上限 LIMIT(GB, 必填): "; read -r v || return 1
         fi
         case "$v" in
+            "") echo "LIMIT 为必填项，请输入。" ; continue ;;
             -1|0) LIMIT="$v"; break ;;
-            *[!0-9.]*) echo "无效上限（仅允许非负数，0/-1=无限制）。" ;;
+            *[!0-9.]*|.*.*.*) echo "无效上限（仅允许非负数，0/-1=无限制），请重新输入。" ; continue ;;
+            .*) echo "无效上限（仅允许非负数，0/-1=无限制），请重新输入。" ; continue ;;
             *) LIMIT="$v"; break ;;
         esac
     done
-    printf "流量口径 STAT_MODE [in入站/out出站/max取大/min取小/sum总和, 默认 %s]: " "$_d_stat"; read -r v || return 1
-    case "$v" in
-        in|out|max|min|sum) STAT_MODE="$v" ;;
-        "") STAT_MODE="$_d_stat" ;;
-        *) echo "无效口径，用默认值 $_d_stat。" ; STAT_MODE="$_d_stat" ;;
-    esac
+    echo "流量口径 STAT_MODE 可选项："
+    echo "  in=入站  out=出站  max=取大  min=取小  sum=总和"
+    while :; do
+        printf "流量口径 [默认 %s]: " "$_d_stat"; read -r v || return 1
+        case "$v" in
+            "") STAT_MODE="$_d_stat"; break ;;
+            in|out|max|min|sum) STAT_MODE="$v"; break ;;
+            *) echo "无效口径，请从 in/out/max/min/sum 中选择。" ;;
+        esac
+    done
     printf "SSH 端口 [%s]: " "$_d_ssh"; read -r v || return 1
     [ -n "$v" ] && SSH_PORT="$v" || SSH_PORT="$_d_ssh"
     printf "DNS 服务器(空格分隔, 留空自动) [%s]: " "${_d_dns:-自动}"; read -r v || return 1
