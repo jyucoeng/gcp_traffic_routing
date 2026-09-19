@@ -16,14 +16,16 @@
 
 | 部署方式 | 行为 |
 |------|------|
-| `PLATFORM=gcp LIMIT=180 bash /root/traffic_ctrl.sh` | 纯封网版：超限封网 + 每月自动重置（**LIMIT 必须显式指定**，无平台默认值），不发任何通知 |
-| `PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh` | 同上，并额外在**断网时 / 网络恢复时**发送 Telegram 通知 |
+| `PLATFORM=gcp LIMIT=180 bash traffic_ctrl.sh` | 纯封网版：超限封网 + 每月自动重置（**LIMIT 必须显式指定**，无平台默认值），不发任何通知 |
+| `PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash traffic_ctrl.sh` | 同上，并额外在**断网时 / 网络恢复时**发送 Telegram 通知 |
 
 两个 `TELEGRAM_*` 环境变量**均非空**才启用通知；任一为空即纯封网版。
 `PLATFORM` 为平台标识（**大小写不敏感，含 `oracle`/`甲骨文` 即触发 oracle 逻辑**，可含中文如 `oracle首尔`，TG 标题原样显示），无需维护多套文件。
 
 > **改配置统一通过子命令，勿手改配置文件。** 部署时全部参数固化到 **`/etc/traffic_routing/netMonitor.conf`**（权限 0600）。
+
 > 之后调上限/端口/TG/日志保留天数，运行 **`bash /root/traffic_ctrl.sh edit`**（交互式菜单），改完自动加密落盘并即时生效（无需重新部署）。
+
 > **⚠️ TG 凭据不明文落盘**：`TELEGRAM_BOT_TOKEN_ENC` / `TELEGRAM_CHAT_ID_ENC` 为 AES-256 加密密文（密钥存 `/etc/traffic_routing/netMonitor.key`，权限 0600）。换凭据请用子命令 `set-tg`，不要手改密文。
 
 > **部署脚本建议下载到 VPS 本地保存**：封网后 VPS 断外网，但本地 `traffic_ctrl.sh` 仍可直接运行——可随时 `edit` 调配置、`set-tg` 换凭据、甚至**重新部署**（不依赖网络）。
