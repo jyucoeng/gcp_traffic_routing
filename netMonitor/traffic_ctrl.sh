@@ -960,6 +960,13 @@ read_traffic() {
 # 输入: 字节数  输出: 如 512.00MB / 123.45GB / 1.23TB
 # 规则: <1GB 用 MB; 1GB~1024GB 用 GB; >=1024GB 用 TB
 # ==========================================
+# 小数补前导 0: bc 输出如 .65 时补成 0.65 (终端/TG/日志统一正常显示)
+fmt_fix() {
+    case "\$1" in
+        .*) echo "0\$1" ;;
+        *)  echo "\$1" ;;
+    esac
+}
 format_traffic() {
     local bytes b
     bytes="\$1"
@@ -969,13 +976,13 @@ format_traffic() {
     b=\$(echo "scale=2; \$bytes / 1073741824" | bc)   # 换算成 GB
     if [ \$(echo "\$b < 1" | bc) -eq 1 ]; then
         # 不足 1GB -> MB
-        echo "\$(echo "scale=2; \$bytes / 1048576" | bc)MB"
+        echo "\$(fmt_fix "\$(echo "scale=2; \$bytes / 1048576" | bc)")MB"
     elif [ \$(echo "\$b < 1024" | bc) -eq 1 ]; then
         # 1GB ~ 1024GB -> GB
-        echo "\${b}GB"
+        echo "\$(fmt_fix "\${b}")GB"
     else
         # >= 1024GB (1TB) -> TB
-        echo "\$(echo "scale=2; \$bytes / 1073741824 / 1024" | bc)TB"
+        echo "\$(fmt_fix "\$(echo "scale=2; \$bytes / 1073741824 / 1024" | bc)")TB"
     fi
 }
 
@@ -1078,7 +1085,6 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
         # 超限时发送 TG 通知 (TG 启用时)
         if [ "\$TG_ON" = "1" ]; then
             IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
-            RUN_TIME=\$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')   # TG 展示用北京时间 (busybox TZ=UTC-8 = UTC+8)
             # CPU 行 (仅 oracle 显示)
             CPU_LINE=""
             if is_oracle_platform; then
@@ -1086,14 +1092,28 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
 🌐 CPU: \$(get_cpu_type)"
             fi
 
-            # 组装通知文本 (oracle 时含 CPU 行)
+            # 已用流量(计费口径 BAL)及其显示单位; 上限若与已用流量单位不同, 追加换算值 (如 上限: 0.0001 GB (0.10 MB))
+            USED_FMT="\$(format_traffic "\$BAL_BYTES")"
+            USED_UNIT="\$(printf '%s' "\$USED_FMT" | grep -oE 'MB|GB|TB' | tail -n1)"
+            LIMIT_DISPLAY="\$LIMIT GB"
+            if [ -n "\$USED_UNIT" ] && [ "\$USED_UNIT" != "GB" ]; then
+                case "\$USED_UNIT" in
+                    MB) LIMIT_DIV=1048576 ;;
+                    TB) LIMIT_DIV=1099511627776 ;;
+                    *)  LIMIT_DIV=1073741824 ;;
+                esac
+                LIMIT_CONV="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES / \$LIMIT_DIV" | bc)")\$USED_UNIT"
+                LIMIT_DISPLAY="\$LIMIT GB (\$LIMIT_CONV)"
+            fi
+
+            # 组装通知文本 (oracle 时含 CPU 行); 运行时间在组装消息时(发送前最后一刻)才取, 尽量接近实际发送时刻
 TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 
 🌐 本机IP: \$MASKED_IP (\$LOC)
-🕐 运行时间: \$RUN_TIME
+🕐 运行时间: \$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')
 📚 网络状态: 正常 ---> 超限(双向封网)
-📊 计费口径: \$STAT_MODE (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))
-🌐 计费流量: \$(format_traffic "\$BAL_BYTES") / 上限: \$LIMIT GB\${CPU_LINE}"
+📊 计费口径: \$STAT_MODE / 上限: \$LIMIT_DISPLAY
+📊 已用流量: \$USED_FMT (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${CPU_LINE}"
 
             tg_send "\$TG_MSG"
             log "已发送流量超限 TG 通知。"
@@ -1138,9 +1158,11 @@ TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 
         # 在三条主链最顶部各插入一条跳转到 TRAFFIC_BLOCKED (全局封锁)
         # 用 -I 1 插到最前，确保封网生效；不动各链已有的其他规则与默认策略
-        "\$FW" -I INPUT   1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
-        "\$FW" -I OUTPUT  1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
-        "\$FW" -I FORWARD 1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+        # 幂等去重: 跳转已存在则跳过 (cron 每5分钟重复触发超限时不再堆积重复规则)
+        for _CHAIN in INPUT OUTPUT FORWARD; do
+            "\$FW" -C "\$_CHAIN" -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null \
+                || "\$FW" -I "\$_CHAIN" 1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
+        done
     }
     [ "\$HAS_V4" = "1" ] && command -v iptables  >/dev/null 2>&1 && apply_fw iptables  icmp
     [ "\$HAS_V6" = "1" ] && command -v ip6tables >/dev/null 2>&1 && apply_fw ip6tables ipv6-icmp
@@ -1308,6 +1330,13 @@ read_traffic_last() {
     if ! [[ "\$LAST_MONTH_RX" =~ ^[0-9]+$ ]]; then LAST_MONTH_RX=0; fi
 }
 
+# 小数补前导 0: bc 输出如 .65 时补成 0.65 (终端/TG/日志统一正常显示)
+fmt_fix() {
+    case "\$1" in
+        .*) echo "0\$1" ;;
+        *)  echo "\$1" ;;
+    esac
+}
 # 流量格式化: 按 MB -> GB -> TB 层级递进
 format_traffic() {
     local bytes b
@@ -1317,11 +1346,11 @@ format_traffic() {
     esac
     b=\$(echo "scale=2; \$bytes / 1073741824" | bc)
     if [ \$(echo "\$b < 1" | bc) -eq 1 ]; then
-        echo "\$(echo "scale=2; \$bytes / 1048576" | bc)MB"
+        echo "\$(fmt_fix "\$(echo "scale=2; \$bytes / 1048576" | bc)")MB"
     elif [ \$(echo "\$b < 1024" | bc) -eq 1 ]; then
-        echo "\${b}GB"
+        echo "\$(fmt_fix "\${b}")GB"
     else
-        echo "\$(echo "scale=2; \$bytes / 1073741824 / 1024" | bc)TB"
+        echo "\$(fmt_fix "\$(echo "scale=2; \$bytes / 1073741824 / 1024" | bc)")TB"
     fi
 }
 
