@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.6}"
+VERSION="${VERSION:-v1.0.7}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -754,6 +754,12 @@ menu_net_status() {
         printf '\033[32m● 正常\033[0m'
     fi
 }
+# 菜单停顿：子操作完成后停住，按任意键回菜单（非交互 stdin 下直接回菜单）
+menu_pause() {
+    printf "\033[32m按任意键返回菜单...\033[0m"
+    read -r -n1 _k < /dev/tty 2>/dev/null || read -r _k 2>/dev/null || true
+    echo ""
+}
 main_menu() {
     require_root
     while :; do
@@ -786,18 +792,22 @@ main_menu() {
                 else
                     menu_install_ask 1 && do_install
                 fi
+                menu_pause
                 ;;
             2)
                 menu_install_ask 2 && do_install
+                menu_pause
                 ;;
             3)
                 config_show
+                menu_pause
                 ;;
             4)
                 config_edit
                 ;;
             5)
                 menu_check
+                menu_pause
                 ;;
             6)
                 printf "确认恢复网络？将清除封网规则并重置当月统计 (y/N): "; read -r a
@@ -805,9 +815,11 @@ main_menu() {
                     y|Y|yes|YES) menu_restore ;;
                     *) echo "-> 已取消。" ;;
                 esac
+                menu_pause
                 ;;
             7)
                 menu_update
+                menu_pause
                 ;;
             8)
                 printf "确认重置本月 TG 发送计数？超限/恢复通知可重新各发 1 条 (y/N): "; read -r a
@@ -815,6 +827,7 @@ main_menu() {
                     y|Y|yes|YES) tg_notify_reset ;;
                     *) echo "-> 已取消。" ;;
                 esac
+                menu_pause
                 ;;
             9)
                 printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
@@ -822,6 +835,7 @@ main_menu() {
                     y|Y|yes|YES) uninstall ;;
                     *) echo "-> 已取消。" ;;
                 esac
+                menu_pause
                 ;;
             0|q|Q)
                 echo -e "\033[32m感谢使用本脚本，再见👋\033[0m"
