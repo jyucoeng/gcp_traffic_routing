@@ -45,26 +45,26 @@
 
 ```bash
 # 1. 先下载部署脚本到本地保存（封网后断外网也能运行）
-wget -O /root/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh
-chmod +x /root/traffic_ctrl.sh
+mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chm
+od +x /root/traffic_routing/traffic_ctrl.sh && cd /root/traffic_routing
 
 # 2. 纯封网版-没有tg通知（gcp 无默认上限，这里显式指定 180GB）
-PLATFORM=gcp LIMIT=180 bash /root/traffic_ctrl.sh
+PLATFORM=gcp LIMIT=180 bash traffic_ctrl.sh
 
 # 纯封网版，部署到 oracle，上限 500GB，SSH 端口 2222
-PLATFORM=oracle LIMIT=500 SSH_PORT=2222 bash /root/traffic_ctrl.sh
+PLATFORM=oracle LIMIT=500 SSH_PORT=2222 bash traffic_ctrl.sh
 
 # 自定义平台示例：aws，手动指定上限 1024GB
 PLATFORM=aws LIMIT=1024 bash /root/traffic_ctrl.sh
 
 # TG 通知版，部署到 oracle（启用断网/恢复的tg通知）
-PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh
+PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash traffic_ctrl.sh
 
 # TG 通知版，部署到 oracle首尔（平台名可含中文，含 oracle 即触发 oracle 逻辑，TG 标题显示对应平台名；小 LIMIT 用于测试断网/TG）
 PLATFORM='oracle首尔' LIMIT=0.0002 \
 TELEGRAM_BOT_TOKEN=xxx \
 TELEGRAM_CHAT_ID=yyy \
-bash /root/traffic_ctrl.sh req
+bash traffic_ctrl.sh req
 ```
 
 > 若 GitHub 无法访问，也可先用 `curl -O https://raw.githubusercontent.com/...` 下载。
@@ -79,10 +79,10 @@ LIMIT=180            -> 上限 180GB
 
 ### TG 通知版注意事项
 
-- 部署后改配置**统一通过子命令**，勿手改配置文件：`bash /root/traffic_ctrl.sh edit`（交互式菜单）。
-- **换 TG 凭据**：`TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh set-tg`（AES-256 重新加密落盘，不影响其他配置）。
-- **停用 TG**：`bash /root/traffic_ctrl.sh clear-tg`。
-- **查看当前配置**：`bash /root/traffic_ctrl.sh config`（密钥解密后以掩码显示，中间一半用 `*` 遮蔽）。
+- 部署后改配置**统一通过子命令**，勿手改配置文件：`bash traffic_ctrl.sh edit`（交互式菜单）。
+- **换 TG 凭据**：`TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash traffic_ctrl.sh set-tg`（AES-256 重新加密落盘，不影响其他配置）。
+- **停用 TG**：`bash /traffic_ctrl.sh clear-tg`。
+- **查看当前配置**：`bash traffic_ctrl.sh config`（密钥解密后以掩码显示，中间一半用 `*` 遮蔽）。
 - **掩码算法**：`*` 数量 = 字符总数 / 2，首尾各保留剩余一半（即只暴露一半），过短(≤4位)则全隐藏。
 - 未传 TG 环境变量仍会正常部署纯封网版（终端仅提示一次"通知未启用"）。
 
@@ -242,7 +242,7 @@ VERSION="v0.1.0"                        # 版本号（部署期常量）
 TELEGRAM_BOT_TOKEN_ENC="U2FsdGVkX1..."  # AES-256 密文（勿手改，用 set-tg）
 TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-tg）
 ```
-- 修改任何配置统一用 `bash /root/traffic_ctrl.sh edit`（交互式菜单），改完自动加密落盘、即时生效；
+- 修改任何配置统一用 `bash traffic_ctrl.sh edit`（交互式菜单），改完自动加密落盘、即时生效；
 - 换 TG 凭据也可用 `set-tg`（会重新加密），停用用 `clear-tg`，查看用 `config`（掩码显示）；
 - 密钥文件 `/etc/traffic_routing/netMonitor.key`（0600）丢失后密文**不可恢复**，需重新 `set-tg`。
 
@@ -253,7 +253,7 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | `menu`（或无参数） | 进入管理菜单（安装/查看/修改/TG/卸载/退出） |
 | `edit` | 交互式菜单修改平台/上限/口径/SSH端口/DNS/TG/日志保留天数（推荐） |
 | `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
-| `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash /root/traffic_ctrl.sh set-tg`） |
+| `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
 | `del` / `un` | 卸载（删 crontab 调度/运行时脚本/conf/state/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
 | `help` | 显示全部命令用法 |
