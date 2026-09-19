@@ -117,7 +117,7 @@ ufw / firewalld 默认开启（会接管/覆盖 iptables 规则）
 | 特性 | `gcp` | `oracle` |
 |------|-------|----------|
 | 标题 | `🎮 gcp 流量报告` | `🎮 oracle 流量报告` |
-| CPU 行 | 无 | `🌐 CPU: AMD/ARM` |
+| CPU 行 | 无 | `🧠 CPU: AMD/ARM` |
 | 上限 | 需手动指定 `LIMIT` | 需手动指定 `LIMIT` |
 | 额外行为 | 无 | 自动停用 firewalld / ufw |
 

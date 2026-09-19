@@ -156,7 +156,8 @@ uninstall() {
     [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
 
     # 4. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
-    # 卸载只清除本月状态(state)；本月流量计数(netcount)保留 -- 覆盖式重装后继续累计当月实时流量
+    # 卸载只清除本月状态(state)；本月流量计数(netcount)与 TG 月度发送标记(notify)保留 --
+    # 覆盖式重装后继续累计当月实时流量，且同月不重复发送超限/恢复通知
     rm -f /var/lib/traffic_monitor/state 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
     rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
@@ -774,6 +775,11 @@ NETMON_KEY="$NETMON_KEY"
 SCRIPT_DIR="$SCRIPT_DIR"
 LOG_FILE="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
+# TG 发送历史：独立文件，一行一月 (UTC 时间戳)，check/reset 共用；
+# 格式: YYYY-MM OVER=<UTC|-> RESTORE=<UTC|-> (例: 2026-09 OVER=2026-09-19T02:40:00Z RESTORE=-)
+# 每月各最多 1 条的判定依据；与 state 分离存放 —— 删 state / 覆盖重装 / 回落都不清零；
+# 只保留最近 12 个月记录，删文件即手工重置当月限制
+NOTIFY_FILE="/var/lib/traffic_monitor/notify"
 
 # 读取运行时配置
 if [ -r "\$CONF_FILE" ]; then
@@ -782,6 +788,73 @@ else
     echo "错误：缺少配置文件 \$CONF_FILE" >&2
     exit 1
 fi
+
+# 当月超限通知是否已发送 (兼容第一代 OVER_MONTH= 变量行)
+notify_over_sent() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    [ -f "\$NOTIFY_FILE" ] || return 1
+    grep -q "^OVER_MONTH=\$CUR_MONTH\$" "\$NOTIFY_FILE" 2>/dev/null && return 0
+    _line="\$(grep -E "^\$CUR_MONTH[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+    [ -n "\$_line" ] || return 1
+    _v=""
+    for _f in \$_line; do
+        case "\$_f" in
+            OVER=*) _v="\${_f#OVER=}"; break ;;
+        esac
+    done
+    [ -n "\$_v" ] && [ "\$_v" != "-" ]
+}
+
+# 当月恢复通知是否已发送 (兼容第一代 RESTORE_MONTH= 变量行)
+notify_restore_sent() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    [ -f "\$NOTIFY_FILE" ] || return 1
+    grep -q "^RESTORE_MONTH=\$CUR_MONTH\$" "\$NOTIFY_FILE" 2>/dev/null && return 0
+    _line="\$(grep -E "^\$CUR_MONTH[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+    [ -n "\$_line" ] || return 1
+    _v=""
+    for _f in \$_line; do
+        case "\$_f" in
+            RESTORE=*) _v="\${_f#RESTORE=}"; break ;;
+        esac
+    done
+    [ -n "\$_v" ] && [ "\$_v" != "-" ]
+}
+
+# 记一条发送历史 (UTC 时间戳)：\$1=OVER|RESTORE；输出本次时间戳；只保留最近 12 个月
+notify_mark() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    _type="\$1"
+    _ts="\$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    _m="\$CUR_MONTH"
+    mkdir -p "\$(dirname "\$NOTIFY_FILE")"
+    _tmp="\${NOTIFY_FILE}.tmp"
+    _old_over="-"; _old_restore="-"
+    if [ -f "\$NOTIFY_FILE" ]; then
+        _oldline="\$(grep -E "^\${_m}[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+        if [ -n "\$_oldline" ]; then
+            for _f in \$_oldline; do
+                case "\$_f" in
+                    OVER=*) _old_over="\${_f#OVER=}" ;;
+                    RESTORE=*) _old_restore="\${_f#RESTORE=}" ;;
+                esac
+            done
+            [ -n "\$_old_over" ] || _old_over="-"
+            [ -n "\$_old_restore" ] || _old_restore="-"
+        fi
+        grep -Ev '^(OVER_MONTH|RESTORE_MONTH|OVER_TIME|RESTORE_TIME)=' "\$NOTIFY_FILE" 2>/dev/null | grep -Ev "^\${_m}[[:space:]]" > "\$_tmp" 2>/dev/null || : > "\$_tmp"
+    else
+        : > "\$_tmp"
+    fi
+    case "\$_type" in
+        OVER) _old_over="\$_ts" ;;
+        RESTORE) _old_restore="\$_ts" ;;
+    esac
+    printf '%s OVER=%s RESTORE=%s\n' "\$_m" "\${_old_over:--}" "\${_old_restore:--}" >> "\$_tmp"
+    sort -k1,1 "\$_tmp" 2>/dev/null | tail -n 12 > "\$NOTIFY_FILE" 2>/dev/null || tail -n 12 "\$_tmp" > "\$NOTIFY_FILE"
+    rm -f "\$_tmp"
+    printf '%s' "\$_ts"
+}
 
 # 解密 TG 凭据（密文 AES-256 -> 明文，仅内存中使用）
 dec_tg() {
@@ -1075,21 +1148,24 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
     echo "状态: [警告] 流量已超限，正在禁止出站..."
     log "警告：流量超出限制！正在执行封网策略 (双向封锁)..."
 
-    # ---- 仅当本次由正常转为超限时才发送通知 (同一事件周期只发一次) ----
+    # ---- 超限通知：每月最多 1 条 (以 NOTIFY_FILE 的 OVER_MONTH 为准) ----
+    # 状态机照常翻转 (STATE=blocked + 封网每次都执行)，但 TG 只在当月未发送过时才发；
+    # 删 state / 覆盖重装 / 回落再超限都不重发，须手动删 NOTIFY_FILE 才重置
     if [ "\$STATE" != "blocked" ]; then
         STATE=blocked
         BLOCKED_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
         BLOCKED_TX="\$BAL_BYTES"
         save_state
-
-        # 超限时发送 TG 通知 (TG 启用时)
-        if [ "\$TG_ON" = "1" ]; then
+    fi
+    if [ "\$STATE" = "blocked" ]; then
+        # 超限时发送 TG 通知 (TG 启用且当月未发送过时；标记以 notify 历史为准)
+        if [ "\$TG_ON" = "1" ] && ! notify_over_sent; then
             IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
             # CPU 行 (仅 oracle 显示)
             CPU_LINE=""
             if is_oracle_platform; then
                 CPU_LINE="
-🌐 CPU: \$(get_cpu_type)"
+🧠 CPU: \$(get_cpu_type)"
             fi
 
             # 已用流量(计费口径 BAL)及其显示单位; 上限若与已用流量单位不同, 追加换算值 (如 上限: 0.0001 GB (0.10MB))
@@ -1118,18 +1194,23 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
             # 版式: 口径中文名 + 上限(括号内自动换算同单位)一行; 已用流量 + 上行/下行一行
 TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 
-🌐 本机IP: \$MASKED_IP (\$LOC)
+📍 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')
 📚 网络状态: 正常 ---> 超限(双向封网)
 📊 计费口径: \$STAT_LABEL / 上限: \$LIMIT_DISPLAY
 🌐 已用流量: \$USED_FMT / (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${CPU_LINE}"
 
             tg_send "\$TG_MSG"
-            log "已发送流量超限 TG 通知。"
+            OVER_TS="\$(notify_mark OVER)"
+            log "已发送流量超限 TG 通知 (\$OVER_TS)。"
+        else
+            if [ "\$TG_ON" != "1" ]; then
+                log "TG 未启用，跳过超限通知。"
+            else
+                echo "    (本月已发送超限通知，跳过。)"
+                log "本月已发送超限通知，跳过 (见 \$NOTIFY_FILE)。"
+            fi
         fi
-    else
-        echo "    (本周期已发送超限通知，跳过。)"
-        log "本周期已发送超限通知，跳过。"
     fi
 
     # ---- 封禁策略 (双向封锁: INPUT + OUTPUT + FORWARD, 仅放行 SSH/DNS/lo) ----
@@ -1180,11 +1261,12 @@ TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 else
     echo "状态: [正常] 流量未超限。"
 
-    # 若曾在超限状态，但当前流量已回落则状态归位 normal (不发恢复通知，恢复通知由 reset 触发)
+    # 流量回落则状态归位 normal (超限通知标记不清零：同月再超限只封网不重发；
+    # 恢复通知由 reset 触发，此处不发)
     if [ "\$STATE" = "blocked" ]; then
         STATE=normal
         save_state
-        log "检测到流量回落，状态恢复正常。"
+        log "检测到流量回落，状态恢复正常 (超限通知标记保留，同月再超限不重发)。"
     else
         save_state
         log "流量正常。"
@@ -1205,6 +1287,10 @@ SCRIPT_DIR="$SCRIPT_DIR"
 RESET_LOG="/var/log/network_reset.log"
 LOG_FILE="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
+# TG 发送历史 (与 check 共用同一文件：一行一月 UTC 时间戳，OVER 超限 / RESTORE 恢复)；
+# 格式: YYYY-MM OVER=<UTC|-> RESTORE=<UTC|->；每月各最多 1 条的判定依据；
+# reset 只记恢复、保留超限；只保留最近 12 个月
+NOTIFY_FILE="/var/lib/traffic_monitor/notify"
 # 上个月流量月度档案 (长期留存): 每次月度重置时把上月最终上下行追加一行, 一行一月
 ARCHIVE_FILE="/var/lib/traffic_monitor/archive"
 
@@ -1215,6 +1301,73 @@ else
     echo "错误：缺少配置文件 \$CONF_FILE" >&2
     exit 1
 fi
+
+# 当月超限通知是否已发送 (兼容第一代 OVER_MONTH= 变量行)
+notify_over_sent() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    [ -f "\$NOTIFY_FILE" ] || return 1
+    grep -q "^OVER_MONTH=\$CUR_MONTH\$" "\$NOTIFY_FILE" 2>/dev/null && return 0
+    _line="\$(grep -E "^\$CUR_MONTH[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+    [ -n "\$_line" ] || return 1
+    _v=""
+    for _f in \$_line; do
+        case "\$_f" in
+            OVER=*) _v="\${_f#OVER=}"; break ;;
+        esac
+    done
+    [ -n "\$_v" ] && [ "\$_v" != "-" ]
+}
+
+# 当月恢复通知是否已发送 (兼容第一代 RESTORE_MONTH= 变量行)
+notify_restore_sent() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    [ -f "\$NOTIFY_FILE" ] || return 1
+    grep -q "^RESTORE_MONTH=\$CUR_MONTH\$" "\$NOTIFY_FILE" 2>/dev/null && return 0
+    _line="\$(grep -E "^\$CUR_MONTH[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+    [ -n "\$_line" ] || return 1
+    _v=""
+    for _f in \$_line; do
+        case "\$_f" in
+            RESTORE=*) _v="\${_f#RESTORE=}"; break ;;
+        esac
+    done
+    [ -n "\$_v" ] && [ "\$_v" != "-" ]
+}
+
+# 记一条发送历史 (UTC 时间戳)：\$1=OVER|RESTORE；输出本次时间戳；只保留最近 12 个月
+notify_mark() {
+    [ -n "\$CUR_MONTH" ] || CUR_MONTH=\$(date '+%Y-%m')
+    _type="\$1"
+    _ts="\$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    _m="\$CUR_MONTH"
+    mkdir -p "\$(dirname "\$NOTIFY_FILE")"
+    _tmp="\${NOTIFY_FILE}.tmp"
+    _old_over="-"; _old_restore="-"
+    if [ -f "\$NOTIFY_FILE" ]; then
+        _oldline="\$(grep -E "^\${_m}[[:space:]]" "\$NOTIFY_FILE" 2>/dev/null | tail -n1)"
+        if [ -n "\$_oldline" ]; then
+            for _f in \$_oldline; do
+                case "\$_f" in
+                    OVER=*) _old_over="\${_f#OVER=}" ;;
+                    RESTORE=*) _old_restore="\${_f#RESTORE=}" ;;
+                esac
+            done
+            [ -n "\$_old_over" ] || _old_over="-"
+            [ -n "\$_old_restore" ] || _old_restore="-"
+        fi
+        grep -Ev '^(OVER_MONTH|RESTORE_MONTH|OVER_TIME|RESTORE_TIME)=' "\$NOTIFY_FILE" 2>/dev/null | grep -Ev "^\${_m}[[:space:]]" > "\$_tmp" 2>/dev/null || : > "\$_tmp"
+    else
+        : > "\$_tmp"
+    fi
+    case "\$_type" in
+        OVER) _old_over="\$_ts" ;;
+        RESTORE) _old_restore="\$_ts" ;;
+    esac
+    printf '%s OVER=%s RESTORE=%s\n' "\$_m" "\${_old_over:--}" "\${_old_restore:--}" >> "\$_tmp"
+    sort -k1,1 "\$_tmp" 2>/dev/null | tail -n 12 > "\$NOTIFY_FILE" 2>/dev/null || tail -n 12 "\$_tmp" > "\$NOTIFY_FILE"
+    rm -f "\$_tmp"
+    printf '%s' "\$_ts"
+}
 
 # 解密 TG 凭据
 dec_tg() {
@@ -1480,9 +1633,10 @@ log "流量统计已重置 (netstat.sh 当月累计清零)。"
 #    在防火墙已全部放开之后发送 (此时网络可用，能获取 IP)
 sleep 1
 
-# 判定是否需要发恢复通知: 仅当 STATE=blocked (即上个周期确实超限封网过) 才需要
+# 判定是否需要发恢复通知：上月确实超限封网过 + TG 启用 + 当月未发送过恢复通知
+# (以 notify 历史为准；上月月份与恢复月份天然不同月，无需额外比对)
 NEED_RESTORE=0
-if [ "\$STATE" = "blocked" ] && [ "\$TG_ON" = "1" ]; then
+if [ "\$STATE" = "blocked" ] && [ "\$TG_ON" = "1" ] && ! notify_restore_sent; then
     NEED_RESTORE=1
 fi
 
@@ -1601,16 +1755,23 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 
     TG_MSG="🎮 \$PLATFORM 流量报告（网络恢复通知）
 
-🌐 本机IP: \$MASKED_IP (\$LOC)
+📍 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 超限封网 ---> 已恢复
 📊 计费口径: \$STAT_LABEL / 上限: \$LIMIT_DISPLAY_CUR
 🌐 已用流量: \$USED_FMT_CUR / (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${LAST_MONTH_LINE}\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
-    log "已发送网络恢复 TG 通知。"
+    RESTORE_TS="\$(notify_mark RESTORE)"
+    log "已发送网络恢复 TG 通知 (\$RESTORE_TS)。"
 else
-    log "上月网络正常（或 TG 未启用），无需发送恢复通知。"
+    if [ "\$STATE" != "blocked" ]; then
+        log "上月网络正常，无需发送恢复通知。"
+    elif [ "\$TG_ON" != "1" ]; then
+        log "TG 未启用，跳过恢复通知。"
+    else
+        log "本月已发送恢复通知，跳过 (见 \$NOTIFY_FILE)。"
+    fi
 fi
 EOF
 
