@@ -20,12 +20,26 @@ install -m 0755 "${ROOT_DIR}/cdn.sh" "${PACKAGE_DIR}/cdn.sh"
 install -m 0644 "${ROOT_DIR}/README.md" "${PACKAGE_DIR}/README.md"
 install -m 0644 "${ROOT_DIR}/VERSION" "${PACKAGE_DIR}/VERSION"
 
+# 随包离线分发的 CDN 网段清单（文件名取自 cdn.sh 单一事实源），
+# install.sh 解包后落盘到 /usr/local/share/dae/cdnip，断网也可离线使用。
+CDN_CDNIP_FILES="$(sed -n 's/^CDN_CDNIP_FILES="\${CDN_CDNIP_FILES:-\(.*\)}"$/\1/p' "${ROOT_DIR}/cdn.sh")"
+for f in ${CDN_CDNIP_FILES}; do
+  if [ ! -f "${ROOT_DIR}/${f}" ]; then
+    echo "缺少 CDN 网段清单源文件：${ROOT_DIR}/${f}" >&2
+    exit 1
+  fi
+  install -m 0644 "${ROOT_DIR}/${f}" "${PACKAGE_DIR}/${f}"
+done
+
 # 显式钉死权限位：部分平台（MSYS）的 install -m 不生效而直接沿用源文件 mode，
 # 为保证跨平台字节一致，统一以 chmod 兜底（chmod 两平台语义一致）。
 # 包目录本身也须钉死：其 mode 由调用者 umask 决定，若不强制 0755，
 # 则 tar 记录的目录权限随 umask 变化，破坏"同源字节可复现"。
 chmod 0755 "${PACKAGE_DIR}" "${PACKAGE_DIR}/cdn.sh"
 chmod 0644 "${PACKAGE_DIR}/VERSION" "${PACKAGE_DIR}/README.md"
+for f in ${CDN_CDNIP_FILES}; do
+  chmod 0644 "${PACKAGE_DIR}/${f}"
+done
 
 # 归一化 tar 元数据并用 gzip -n 去除时间戳，保证同一内容构建出字节级一致的 bundle。
 # --format=gnu：显式钉死归档格式（GNU tar 1.34 前默认 gnu；1.35 起部分发行版默认

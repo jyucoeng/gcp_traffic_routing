@@ -38,9 +38,9 @@ EXPECTED="$(printf 'hello sha256\n' | shasum -a 256 | awk '{print $1}')"
 assert_eq "$(sha256_file "${TMP}/a.txt")" "${EXPECTED}" "sha256_file 计算正确"
 
 # ---------- verify_bundle：SHA 一致通过 / 不一致拒绝 ----------
-mkdir -p "${TMP}/bundle/gcp_traffic_routing-v0.1.0"
-cp "${SRC}/cdn.sh" "${TMP}/bundle/gcp_traffic_routing-v0.1.0/cdn.sh"
-( cd "${TMP}/bundle" && tar -czf "${TMP}/pkg.tar.gz" "gcp_traffic_routing-v0.1.0" )
+mkdir -p "${TMP}/bundle/gcp_traffic_routing-v0.1.1"
+cp "${SRC}/cdn.sh" "${TMP}/bundle/gcp_traffic_routing-v0.1.1/cdn.sh"
+( cd "${TMP}/bundle" && tar -czf "${TMP}/pkg.tar.gz" "gcp_traffic_routing-v0.1.1" )
 GOOD_SHA="$(sha256_file "${TMP}/pkg.tar.gz")"
 PACKAGE_SHA256="${GOOD_SHA}" verify_bundle "${TMP}/pkg.tar.gz" && ok "verify_bundle 接受匹配 SHA" \
   || bad "verify_bundle 拒绝匹配 SHA"
@@ -58,12 +58,26 @@ else
   bad "install_bundle 未安装 cdn.sh"
 fi
 # 非法脚本应被拒：造一个 cdn.sh 语法错误的包
-mkdir -p "${TMP}/bad/gcp_traffic_routing-v0.1.0"
-printf 'if [[ echo\n' >"${TMP}/bad/gcp_traffic_routing-v0.1.0/cdn.sh"
-( cd "${TMP}/bad" && tar -czf "${TMP}/bad.tar.gz" "gcp_traffic_routing-v0.1.0" )
+mkdir -p "${TMP}/bad/gcp_traffic_routing-v0.1.1"
+printf 'if [[ echo\n' >"${TMP}/bad/gcp_traffic_routing-v0.1.1/cdn.sh"
+( cd "${TMP}/bad" && tar -czf "${TMP}/bad.tar.gz" "gcp_traffic_routing-v0.1.1" )
 rm -f "${TMP}/bin2/cdn"
 ( CDN_BIN="${TMP}/bin2/cdn"; install_bundle "${TMP}/bad.tar.gz" ) >/dev/null 2>&1 \
   && bad "install_bundle 放行语法错误脚本" || ok "install_bundle 拒绝语法错误脚本"
+
+# ---------- install_bundle：随包 CDN 网段清单落盘 ----------
+mkdir -p "${TMP}/b2/gcp_traffic_routing-v0.1.1"
+cp "${SRC}/cdn.sh" "${TMP}/b2/gcp_traffic_routing-v0.1.1/cdn.sh"
+printf '103.21.244.0/22,104.16.0.0/13\n' >"${TMP}/b2/gcp_traffic_routing-v0.1.1/1-cfcdn-ip-15.txt"
+printf '2400:cb00::/32\n' >"${TMP}/b2/gcp_traffic_routing-v0.1.1/1-cfcdn-ipv6-7.txt"
+( cd "${TMP}/b2" && tar -czf "${TMP}/pkg2.tar.gz" "gcp_traffic_routing-v0.1.1" )
+rm -rf "${TMP}/cdnip"
+( CDN_CDNIP_BUNDLED_DIR="${TMP}/cdnip"; CDN_BIN="${TMP}/bin/cdn2"; install_bundle "${TMP}/pkg2.tar.gz" ) >/dev/null 2>&1
+if [ -f "${TMP}/cdnip/1-cfcdn-ip-15.txt" ] && [ -f "${TMP}/cdnip/1-cfcdn-ipv6-7.txt" ]; then
+  ok "install_bundle 落盘随包 CDN 网段清单"
+else
+  bad "install_bundle 未落盘随包 CDN 网段清单"
+fi
 
 # ---------- 非 root 拒绝（main 顶层守卫） ----------
 if [ "${EUID:-$(id -u)}" = "0" ]; then

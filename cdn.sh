@@ -16,8 +16,8 @@ set -eEuo pipefail
 #
 # 命令:
 #   cdn              同 install（TTY 下显示交互菜单：1安装 2设置分流节点 3全量卸载 4退出）
-#   cdn install      安装/更新 dae + cdnip geoip 数据库 + 在线 CDN 网段缓存，并生成配置
-#   cdn update       强制重下 dae 二进制与 geoip 数据库 + CDN 网段缓存，然后重新 apply
+#   cdn install      安装/更新 dae + cdnip geoip 数据库 + 随包 CDN 网段缓存，并生成配置
+#   cdn update       强制重下 dae 二进制与 geoip 数据库 + 重建 CDN 网段缓存，然后重新 apply
 #   cdn add <链接...>      添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），自动 apply
 #   cdn add-sub <url> [标签]  添加订阅，自动 apply
 #   cdn del <匹配>         按序号(1 起)或关键字删除节点，自动 apply
@@ -39,16 +39,29 @@ set -eEuo pipefail
 #   cdn_geoip_url     自定义 geoip.dat 下载地址（默认社区 cdnip 版）
 #   cdn_geoip_sha_url 自定义 sha256 校验文件地址（默认 "${cdn_geoip_url}.sha256sum"）
 #   cdn_skip_geo      跳过 geoip 下载（仅当你已自行放置 /usr/local/share/dae/geoip.dat）
-#   cdn_cdnip_base    在线 CDN 网段清单 base URL（默认 jyucoeng/gcp_traffic_routing main）
+#   cdn_cdnip_bundled_dir 随包离线 CDN 网段清单目录（默认 /usr/local/share/dae/cdnip，离线优先读取）
+#   cdn_cdnip_base    在线回退时的 CDN 网段清单 base URL（默认 jyucoeng/gcp_traffic_routing main）
 #   cdn_cdnip_files   清单文件名列表（可覆盖，空格分隔）
-#   cdn_skip_cdnip    跳过 CDN 网段清单下载（降级为仅 geoip 判定）
+#   cdn_skip_cdnip    跳过 CDN 网段清单缓存（降级为仅 geoip 判定）
 #   cdn_force         强制重装，跳过"已存在"判断（cdn update 内部使用）
 #   CDN_DAE_VERSION_URL 自定义 dae 版本查询接口（默认 GitHub API）
 #   CDN_DIR           工作目录（默认 /usr/local/etc/cdn-manager；测试可覆盖）
 #   CDN_CONF          配置输出路径（默认 /usr/local/etc/dae/config.dae；测试可覆盖）
 ###############################################################################
 
-SCRIPT_VERSION="0.1.0"
+# 版本单一事实源：VERSION 文件（jvucoeng/gcp_traffic_routing VERSION）。
+# 本脚本可能处于 仓库根目录/随包目录（旁边有 VERSION）或独立安装于
+# /usr/local/bin/cdn（无 VERSION 文件）。运行时优先读取同目录 VERSION；
+# 无 VERSION 时回退到下方字面量。字面量必须以版本门禁 check-version.sh 钉死为：
+#   "v${SCRIPT_VERSION}" 恒等于 VERSION 文件内容
+# （发布脚本会据此在构建/门禁阶段校验二者一致，此处仅为独立安装兜底）。
+SCRIPT_VERSION="0.1.1"
+if [ -s "$(dirname "${BASH_SOURCE[0]}")/VERSION" ]; then
+  SCRIPT_VERSION="$(tr -d '\r\n' <"$(dirname "${BASH_SOURCE[0]}")/VERSION")"
+  SCRIPT_VERSION="${SCRIPT_VERSION#v}"
+fi
+VERSION="${SCRIPT_VERSION}"
+AUTHOR="littleDoraemon"
 
 # 项目显示名（菜单标题等处使用）。Fork 本仓库后如想改显示名，改这里即可；
 # 但发布包/安装脚本的仓库名仍以 install.sh 顶部 REPO_NAME 为准。
@@ -72,11 +85,14 @@ CDN_GEOIP_URL_DEFAULT="https://github.com/fatekey/gcp_free/raw/master/geoip.dat"
 CDN_GEOIP_SHA_DEFAULT="${CDN_GEOIP_URL_DEFAULT}.sha256sum"
 CDN_GEOIP_MIRROR="https://cdn.jsdelivr.net/gh/fatekey/gcp_free@master/geoip.dat"
 
-# 在线 CDN 网段 txt 清单（托管于 jyucoeng/gcp_traffic_routing 仓库，不会随意删除；
-# 不随本发布包分发，安装/更新时在线拉取）。对应 Cloudflare/Fastly/Akamai 的
+# CDN 网段 txt 清单（1-cfcdn-ip-15.txt ~ 5-akamai-ip-113.txt 共 7 个）已随发布包
+# 打包，由 install.sh 解包落盘到 ${CDN_CDNIP_BUNDLED_DIR}。cdn 安装/更新时
+# **离线优先**读取本地清单，断网也无需访问 GitHub；仅当本地清单缺失时才回退在线
+# 拉取 ${CDN_CDNIP_BASE}（若不缺则零网络依赖）。对应 Cloudflare/Fastly/Akamai 的
 # v4+v6 官方网段，每行为一条逗号/换行分隔的 CIDR 列表。
 # render 时生成 dip(ipcidr(...)) 规则并置于 dip(geoip:cdnip) 之前：
 #   命中该缓存 -> 直接走 CDN 组；未命中 -> 继续查 geoip.dat(cdnip)。
+CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 CDN_CDNIP_BASE="${CDN_CDNIP_BASE:-https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main}"
 CDN_CDNIP_FILES="${CDN_CDNIP_FILES:-1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastly-ipv6-2.txt 3-akamai_ipv6-64.txt 4-akamai-ip-255.txt 5-akamai-ip-113.txt}"
 CDN_CDNIP_CACHE="${CDN_CDNIP_CACHE:-${DAE_DATA_DIR}/cdnip.txt}"
@@ -335,8 +351,26 @@ cdn_install_geoip() {
   cdn_print_ok "geoip.dat（cdnip 标签）已安装：${DAE_GEOIP}"
 }
 
-# 下载并缓存在线 CDN 网段清单（逗号/换行分隔 CIDR，含 v4+v6），
+# 读取随包安装的本地 CDN 网段清单（离线优先，无需访问 GitHub）。
+# 逐文件拆分逗号/换行并聚合到 stdout；7 个清单全部存在返回 0，
+# 任一缺失打印告警并返回 1（调用方据此回退在线拉取）。
+cdn_read_bundled_cdnip() {
+  local f raw="" missing=0
+  for f in ${CDN_CDNIP_FILES}; do
+    if [ -s "${CDN_CDNIP_BUNDLED_DIR}/${f}" ]; then
+      raw="${raw} $(tr ',' '\n' <"${CDN_CDNIP_BUNDLED_DIR}/${f}")"
+    else
+      cdn_print_warn "本地 CDN 网段清单缺失：${CDN_CDNIP_BUNDLED_DIR}/${f}"
+      missing=1
+    fi
+  done
+  [ "${missing}" = "1" ] && return 1
+  printf '%s' "${raw}"
+}
+
+# 生成/刷新 CDN 网段缓存（逗号/换行分隔 CIDR，含 v4+v6），
 # 供 render 生成 ipcidr 规则作为 geoip.dat 之前的第一层命中判定。
+# 离线优先：先读随包安装的本地清单；本地缺失时才在线拉取。
 # 失败仅告警不中断：降级为纯 geoip(cdnip) 判定。
 cdn_fetch_cdnip() {
   local f url tmp cidr raw="" out=()
@@ -352,18 +386,23 @@ cdn_fetch_cdnip() {
     cdn_print_info "测试模式：跳过 CDN 网段清单在线下载。"
     return 0
   }
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "${tmp:-}"' EXIT
-  for f in ${CDN_CDNIP_FILES}; do
-    url="${CDN_CDNIP_BASE}/${f}"
-    if download_file "${url}" "${tmp}/${f}" 2>/dev/null; then
-      raw="${raw} $(tr ',' '\n' <"${tmp}/${f}")"
-    else
-      cdn_print_warn "CDN 网段清单下载失败：${url}"
-    fi
-  done
-  trap - EXIT
-  rm -rf "${tmp}"
+  if raw="$(cdn_read_bundled_cdnip)"; then
+    cdn_print_info "读取随包安装的本地 CDN 网段清单：${CDN_CDNIP_BUNDLED_DIR}"
+  else
+    cdn_print_warn "本地 CDN 网段清单不完整，尝试在线拉取（${CDN_CDNIP_BASE}）。"
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "${tmp:-}"' EXIT
+    for f in ${CDN_CDNIP_FILES}; do
+      url="${CDN_CDNIP_BASE}/${f}"
+      if download_file "${url}" "${tmp}/${f}" 2>/dev/null; then
+        raw="${raw} $(tr ',' '\n' <"${tmp}/${f}")"
+      else
+        cdn_print_warn "CDN 网段清单下载失败：${url}"
+      fi
+    done
+    trap - EXIT
+    rm -rf "${tmp}"
+  fi
   raw="$(printf '%s' "${raw}" | tr ' ' '\n' | awk 'NF{gsub(/^[ \t\r]+|[ \t\r]+$/, ""); print}')"
   if [ -z "${raw}" ]; then
     cdn_print_warn "未获取到任何 CDN 网段，降级为仅使用 geoip.dat（cdnip）判定。"
@@ -871,6 +910,7 @@ cdn_apply() {
 }
 
 cdn_install() {
+  local pre_node pre_i=0
   require_root
   detect_init_system
   cdn_check_container
@@ -880,6 +920,16 @@ cdn_install() {
   cdn_install_geoip
   cdn_fetch_cdnip
   cdn_env_preload
+  # 尾部位置参数即节点：方案二统一入口（安装 + 加节点 一条命令）
+  if [ "$#" -gt 0 ]; then
+    CDN_NO_APPLY=1
+    for pre_node in "$@"; do
+      pre_node="${pre_node%\'}"; pre_node="${pre_node#\'}"
+      pre_node="${pre_node%\"}"; pre_node="${pre_node#\"}"
+      cdn_add_impl node "${pre_node}" || pre_i=$((pre_i + 1))
+    done
+    unset CDN_NO_APPLY
+  fi
   if [ -f "${CDN_NODES}" ] || [ -f "${CDN_SUBS}" ]; then
     cdn_apply
   else
@@ -983,11 +1033,19 @@ cdn_menu_uninstall() {
   return 1
 }
 
+menu_header() {
+    echo "========================="
+    echo " GCP自动分流CDN流量脚本(dae版)"
+    echo " Author：${AUTHOR}"
+    echo " Version: ${VERSION}"
+    echo " 快捷指令：${CDNR_NAME:-cdnr}"
+    echo "========================="
+}
+
 cdn_menu() {
   local choice
   while :; do
-    printf '\n%s\n' "${PROJECT_NAME} 管理器（dae CDN 分流）"
-    printf '%s\n'   "=============================="
+    menu_header
     printf '1) 安装（dae + geoip + CDN 网段缓存 + 配置）\n'
     printf '2) 设置分流节点（vless/vmess/trojan/hysteria2/tuic/anytls）\n'
     printf '3) 全量卸载\n'
@@ -1046,7 +1104,8 @@ print_usage() {
   cdn_policy          节点选择策略（默认 min）
   cdn_geoip_url / cdn_geoip_sha_url   自定义 geoip.dat 与校验地址
   cdn_skip_geo        跳过 geoip 下载（需自备 /usr/local/share/dae/geoip.dat）
-  cdn_cdnip_base / cdn_cdnip_files    在线 CDN 网段清单地址与文件名（默认 jyucoeng/gcp_traffic_routing main）
+  cdn_cdnip_bundled_dir  随包离线 CDN 网段清单目录（离线优先读取，默认 /usr/local/share/dae/cdnip）
+  cdn_cdnip_base / cdn_cdnip_files    在线回退时的 CDN 网段清单地址与文件名（默认 jyucoeng/gcp_traffic_routing main）
   cdn_skip_cdnip      跳过 CDN 网段缓存（降级为仅 geoip 判定）
 EOF
 }
@@ -1062,7 +1121,8 @@ main() {
     fi
     ;;
   install)
-    cdn_install
+    shift
+    cdn_install "$@"
     ;;
   update)
     cdn_update

@@ -84,6 +84,29 @@ if [ -n "${PACKAGE_SHA256}" ]; then
   else
     bad "bundle 缺少 cdn.sh"
   fi
+  # 随包离线 CDN 网段清单：源文件存在 + 已打入 bundle
+  S_FILES="$(sed -n 's/^CDN_CDNIP_FILES="\${CDN_CDNIP_FILES:-\(.*\)}"$/\1/p' "${ROOT_DIR}/cdn.sh")"
+  if [ -n "${S_FILES}" ] && [ "${S_FILES}" = "${CDN_CDNIP_FILES}" ]; then
+    ok "install.sh 与 cdn.sh 的 CDN 网段清单文件列表一致"
+  else
+    bad "install.sh 与 cdn.sh 的 CDN 网段清单文件列表不一致（install=${CDN_CDNIP_FILES:-空} / cdn=${S_FILES:-空}）"
+  fi
+  BUNDLED_MISSING=0
+  n=0
+  for f in ${CDN_CDNIP_FILES}; do
+    n=$((n + 1))
+    if [ ! -f "${ROOT_DIR}/${f}" ]; then
+      bad "缺少 CDN 网段清单源文件：${f}"
+      BUNDLED_MISSING=1
+    fi
+    if ! tar -tzf "${BUNDLE}" | grep -qx "${REPO_NAME}-${VERSION}/${f}"; then
+      bad "bundle 缺少随包 CDN 网段清单：${f}"
+      BUNDLED_MISSING=1
+    fi
+  done
+  if [ "${BUNDLED_MISSING}" = "0" ] && [ "${n}" -gt 0 ]; then
+    ok "bundle 内含 ${n} 个随包 CDN 网段清单 txt（离线可用）"
+  fi
 else
   bad "install.sh 缺少 PACKAGE_SHA256（尚未回填）"
 fi

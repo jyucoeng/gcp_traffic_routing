@@ -34,6 +34,50 @@ source "${SRC}/cdn.sh"
 # 预置 CDN 网段缓存 fixture（含一条非法条目，用于断言过滤）
 printf '104.16.0.0/13\n2400:cb00::/32\n104.24.0.0/14\nnot-a-cidr\n2.2.2.2/24\n' >"${CDN_CDNIP_CACHE}"
 
+# ---------- cdn_read_bundled_cdnip / 离线缓存：随包清单（无网络） ----------
+mkdir -p "${TMP}/bundled"
+printf '103.21.244.0/22,104.16.0.0/13\n'    >"${TMP}/bundled/1-cfcdn-ip-15.txt"
+printf '2400:cb00::/32\n'                    >"${TMP}/bundled/1-cfcdn-ipv6-7.txt"
+printf '2.2.2.2/24,2.3.4.5/24\n'             >"${TMP}/bundled/2-fastly-ip-19.txt"
+printf '2a04:4e40::/32\n'                    >"${TMP}/bundled/2-fastly-ipv6-2.txt"
+printf '2001:218:3004::/48\n'                >"${TMP}/bundled/3-akamai_ipv6-64.txt"
+printf '104.200.16.0/20,not-a-cidr\n'        >"${TMP}/bundled/4-akamai-ip-255.txt"
+printf '61.19.5.0/24\n'                      >"${TMP}/bundled/5-akamai-ip-113.txt"
+
+RAW="$(CDN_CDNIP_BUNDLED_DIR="${TMP}/bundled" cdn_read_bundled_cdnip)"
+for cidr in 103.21.244.0/22 104.16.0.0/13 2400:cb00::/32 2.2.2.2/24 2.3.4.5/24 2a04:4e40::/32 2001:218:3004::/48 104.200.16.0/20 61.19.5.0/24; do
+  if printf '%s' "${RAW}" | grep -qF "${cidr}"; then
+    ok "bundled 聚合包含 ${cidr}"
+  else
+    bad "bundled 聚合缺失 ${cidr}"
+  fi
+done
+if CDN_CDNIP_BUNDLED_DIR="${TMP}/bundled" CDN_CDNIP_FILES='1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt missing-4.txt' cdn_read_bundled_cdnip >/dev/null 2>&1; then
+  bad "bundled 缺文件未返回失败"
+else
+  ok "bundled 缺文件返回非 0（触发在线回退）"
+fi
+rm -f "${CDN_CDNIP_CACHE}"
+( CDN_TEST_MODE=0; CDN_CDNIP_BUNDLED_DIR="${TMP}/bundled"; cdn_fetch_cdnip ) >/dev/null 2>&1
+OFFCACHE="$(cat "${CDN_CDNIP_CACHE}" 2>/dev/null || true)"
+if [ -s "${CDN_CDNIP_CACHE}" ]; then
+  ok "离线模式（CDN_TEST_MODE=0）用随包清单生成缓存"
+else
+  bad "离线模式未生成缓存"
+fi
+if printf '%s' "${OFFCACHE}" | grep -qx '2.2.2.2/24'; then
+  ok "离线缓存跨文件聚合正确"
+else
+  bad "离线缓存跨文件聚合异常"
+fi
+if printf '%s' "${OFFCACHE}" | grep -q 'not-a-cidr'; then
+  bad "离线缓存混入非法条目"
+else
+  ok "离线缓存非法条目被过滤"
+fi
+# 恢复 render 相关 fixture 缓存（离线测试覆盖了缓存，需还原）
+printf '104.16.0.0/13\n2400:cb00::/32\n104.24.0.0/14\nnot-a-cidr\n2.2.2.2/24\n' >"${CDN_CDNIP_CACHE}"
+
 V="vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@1.2.3.4:443?encryption=none&security=tls#Name"
 T="trojan://password123456@5.6.7.8:443#troj"
 H2="hysteria2://h2pass@4.4.4.4:8443?sni=example.com&insecure=1#h2"
