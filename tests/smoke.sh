@@ -136,34 +136,45 @@ fi
 
 # ---------- cdn_render_config：结构与策略 ----------
 OUT="$(cdn_render_config)"
-if [[ "${OUT}" == *"dip(geoip:cdnip) -> my_group"* ]]; then
-  ok "render 包含 CDN 分流规则"
+if [[ "${OUT}" == *"dip(geoip:cdnip) -> cdn_geoip_group"* ]]; then
+  ok "render 包含 CDN 分流规则（geoip:cdnip -> cdn_geoip_group）"
 else
-  bad "render 缺少 dip(geoip:cdnip) -> my_group"
+  bad "render 缺少 dip(geoip:cdnip) -> cdn_geoip_group"
+fi
+if [[ "${OUT}" == *"cdn_cache_group"* ]] && [[ "${OUT}" == *"cdn_geoip_group"* ]]; then
+  ok "render 定义 cdn_cache_group + cdn_geoip_group 两个分流组"
+else
+  bad "render 缺少 cdn_cache_group/cdn_geoip_group 分组"
+fi
+if [[ "${OUT}" == *"log_level: debug"* ]]; then
+  ok "render 默认 log_level: debug（输出每连接分流明细）"
+else
+  bad "render 缺少 log_level: debug"
 fi
 if [[ "${OUT}" == *"fallback: direct"* ]]; then
   ok "render 其余流量直连（fallback: direct）"
 else
   bad "render 缺少 fallback: direct"
 fi
-# ---------- cdn render：CDN 网段缓存（ipcidr）优先于 geoip ----------
-# 先命中缓存走 CDN 组，未命中再查 dip(geoip:cdnip)；规则顺序必须满足 ipcidr 在 geoip 之前
-if [[ "${OUT}" == *"dip(ipcidr(104.16.0.0/13,2400:cb00::/32,104.24.0.0/14,2.2.2.2/24)) -> my_group"* ]]; then
-  ok "render 将 CDN 网段缓存渲染为 ipcidr() 子网匹配规则（非法条目被过滤）"
+# ---------- cdn render：CDN 网段缓存（dip(CIDR,...)）优先于 geoip ----------
+# 先命中缓存走 cdn_cache_group，未命中再查 dip(geoip:cdnip)->cdn_geoip_group；缓存行必须在 geoip 之前
+# dae v2 语法：dip() 直接接受 CIDR 列表（不存在 ipcidr()），IPv6 需引号包裹，全部统一加引号
+if [[ "${OUT}" == *"dip('104.16.0.0/13','2400:cb00::/32','104.24.0.0/14','2.2.2.2/24') -> cdn_cache_group"* ]]; then
+  ok "render 将 CDN 网段缓存渲染为 dip('CIDR',...) -> cdn_cache_group（非法条目被过滤）"
 else
-  bad "render 未输出 ipcidr 缓存规则或子网顺序异常"
+  bad "render 未输出 dip('CIDR',...) -> cdn_cache_group 缓存规则或子网顺序异常"
 fi
 if [[ "${OUT}" == *"not-a-cidr"* ]]; then
   bad "render 混入了非法条目（应被过滤）"
 else
   ok "render 非法条目被过滤"
 fi
-first_ipcidr="$(printf '%s\n' "${OUT}" | grep -n 'dip(ipcidr' | head -n1 | cut -d: -f1)"
+first_ipcidr="$(printf '%s\n' "${OUT}" | grep -nE "dip\('[0-9]" | head -n1 | cut -d: -f1)"
 first_geoip="$(printf '%s\n' "${OUT}" | grep -n 'dip(geoip:cdnip)' | head -n1 | cut -d: -f1)"
 if [ -n "${first_ipcidr}" ] && [ -n "${first_geoip}" ] && [ "${first_ipcidr}" -lt "${first_geoip}" ]; then
-  ok "ipcidr 缓存规则位于 geoip 之前（先缓存命中，未命中再查 geoip）"
+  ok "CIDR 缓存规则位于 geoip 之前（先缓存命中，未命中再查 geoip）"
 else
-  bad "规则顺序异常：ipcidr=${first_ipcidr:-无} geoip=${first_geoip:-无}"
+  bad "规则顺序异常：cidr=${first_ipcidr:-无} geoip=${first_geoip:-无}"
 fi
 if [[ "${OUT}" == *"policy: min"* ]]; then
   ok "render 默认策略 min"
@@ -214,6 +225,11 @@ assert_eq "${NODE_AFTER}" "${NODE_BEFORE}" "cdn_add 去重已存在节点 + 忽�
 assert_true  "is_num '123'"    "is_num 接受纯数字"
 assert_false "is_num '1a'"     "is_num 拒绝混入字母"
 assert_false "is_num ''"       "is_num 拒绝空串"
+
+# ---------- cdn_check_container：LXC 检测（/proc/1/environ 回退 + 测试钩子） ----------
+( CDN_FAKE_VIRT=lxc; cdn_check_container ) >/dev/null 2>&1 && bad "容器检测未拒绝 lxc" || ok "容器检测拒绝 lxc（CDN_FAKE_VIRT 钩子）"
+( CDN_FAKE_VIRT=docker; cdn_check_container ) >/dev/null 2>&1 && bad "容器检测未拒绝 docker" || ok "容器检测拒绝 docker"
+( CDN_FAKE_VIRT=kvm; cdn_check_container ) >/dev/null 2>&1 && ok "容器检测放行 kvm 裸机" || bad "容器检测误拒 kvm"
 
 # ---------- 交互菜单（stdin 管道模拟选择；非 TTY 下 bash read 抑制提示但正常读取） ----------
 MENU_OUT="$(printf '4\n' | ( source "${SRC}/cdn.sh"; cdn_menu ) 2>&1 || true)"
@@ -314,7 +330,7 @@ SH
 chmod +x "${TMP}/fakedae-ok" "${TMP}/fakedae-bad"
 rm -f "${CDN_CONF}"
 DAE_BIN="${TMP}/fakedae-ok" cdn_write_config >/dev/null 2>&1
-if [ -f "${CDN_CONF}" ] && [[ "$(cat "${CDN_CONF}")" == *"dip(geoip:cdnip) -> my_group"* ]]; then
+if [ -f "${CDN_CONF}" ] && [[ "$(cat "${CDN_CONF}")" == *"dip(geoip:cdnip) -> cdn_geoip_group"* ]]; then
   ok "write_config 校验通过后写盘"
 else
   bad "write_config 校验通过后未写盘"
@@ -331,6 +347,47 @@ if [ -f "${CDN_CONF}" ]; then
 else
   bad "write_config 空数据未生成配置"
 fi
+
+# ---------- 补全：del 空行不参与编号（与 cdn list 对齐） ----------
+: >"${CDN_NODES}"
+printf '%s\n' "${V}" >"${CDN_NODES}"
+printf '\n' >>"${CDN_NODES}"
+CDN_NO_APPLY=1 cdn_add "${T}" >/dev/null 2>&1
+cdn_del '2' >/dev/null 2>&1
+if ! grep -qxF "${T}" "${CDN_NODES}" && grep -qxF "${V}" "${CDN_NODES}"; then
+  ok "del 序号与 list 对齐（跳过空行，2 删掉 trojan 且不误删 vless）"
+else
+  bad "del 序号未跳过空行（错位删除）"
+fi
+
+# ---------- 补全：del 数字关键字回退（无对应序号时按关键字） ----------
+CDN_NO_APPLY=1 cdn_add 'trojan://tok44321@6.7.8.9:8443#x' >/dev/null 2>&1
+cdn_del '44321' >/dev/null 2>&1
+if ! grep -qxF 'trojan://tok44321@6.7.8.9:8443#x' "${CDN_NODES}"; then
+  ok "del 数字关键字回退匹配（44321 无对应序号，按关键字删除）"
+else
+  bad "del 数字关键字未回退匹配"
+fi
+
+# ---------- 补全：vmess 单独节点也触发 dae validate（校验守卫覆盖 6 协议） ----------
+cat >"${TMP}/fakedae-flag" <<'SH'
+#!/bin/sh
+[ "$1" = "validate" ] && { : >"${FLAGFILE}"; exit 0; }
+exit 1
+SH
+chmod +x "${TMP}/fakedae-flag"
+FLAGFILE="${TMP}/validate-called" export FLAGFILE
+: >"${CDN_NODES}"
+: >"${CDN_SUBS}"
+printf '%s\n' "${VMESS}" >"${CDN_NODES}"
+rm -f "${FLAGFILE}"
+DAE_BIN="${TMP}/fakedae-flag" cdn_write_config >/dev/null 2>&1
+if [ -f "${FLAGFILE}" ]; then
+  ok "write_config 对 vmess 节点触发 dae validate"
+else
+  bad "write_config 未对 vmess 节点触发 validate"
+fi
+: >"${CDN_NODES}"
 
 echo ""
 echo "smoke 结果：${PASS} 通过 / ${FAIL} 失败 / 共 ${TOTAL}"

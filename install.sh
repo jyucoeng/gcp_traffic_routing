@@ -10,7 +10,7 @@ umask 077
 # =============================================================================
 REPO_OWNER="jyucoeng"                 # 你的 GitHub 用户名
 REPO_NAME="gcp_traffic_routing"       # 你的仓库名（保持与仓库 URL 一致）
-PROJECT_VERSION="v0.1.1"              # 发布版本号（与 VERSION 文件一致）
+PROJECT_VERSION="v0.1.2"              # 发布版本号（与 VERSION 文件一致）
 PACKAGE_NAME="${REPO_NAME}-${PROJECT_VERSION}.tar.gz"   # 由上方常量派生，无需手改
 
 # 随包 CDN 网段清单（必须与 cdn.sh 的 CDN_CDNIP_FILES 一致，check-version.sh 会交叉校验）
@@ -18,7 +18,7 @@ CDN_CDNIP_FILES="1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastl
 # 随包离线清单落盘目录（cdn.sh 离线优先读取的默认路径）
 CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256="38561130757f9bcc014ec056d492d090adfa2b816d302ae93a30c221d3b9eea5"
+PACKAGE_SHA256="1b31437ea7fa5c9012b45417921fc901d3e28b89cb7200b90b7c629c950a41ec"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"
@@ -86,6 +86,8 @@ install_bundle() {
   for f in ${CDN_CDNIP_FILES}; do
     if [ -f "${root_dir}/${f}" ]; then
       install -m 0644 "${root_dir}/${f}" "${CDN_CDNIP_BUNDLED_DIR}/${f}"
+    else
+      echo "警告：发布包缺少随包 CDN 网段清单 ${f}（cdn 将回退在线拉取）。" >&2
     fi
   done
   rm -rf "$tmpdir"
@@ -97,9 +99,9 @@ main() {
     exit 1
   fi
   local bundle
+  trap 'rm -f "${bundle:-}"' EXIT
   bundle="$(mktemp)"
   if ! download "${PACKAGE_URL}" "${bundle}"; then
-    rm -f "${bundle}"
     echo "下载发布包失败：${PACKAGE_URL}" >&2
     exit 1
   fi

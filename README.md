@@ -18,7 +18,7 @@ GCP 对出站到部分 CDN 网段（Cloudflare / Fastly / Akamai 等，geodata �
 ## 添加 / 更换目标节点（核心用法）
 
 要转发到的节点由你自己在 VPS 上通过 `cdn add` 提供，**不写死在脚本里**——
-`cdn.sh` 本身不含任何节点链接，节点仅存于数据文件 `/usr/local/etc/cdn-manager/nodes.txt`，
+`cdn.sh` 本身不含任何节点链接，节点仅存于数据文件 `/usr/local/etc/cdn-manager/nodes.list`，
 升级覆盖脚本也不影响，失效时随换随用。
 
 以你常用的两种协议为例（**以下均为占位符，请把 `UUID`/`PASSWORD`/`IP`/`PORT` 换成你自己的真实值**）：
@@ -31,7 +31,7 @@ cdn add 'vless://UUID@IP:PORT?encryption=none&flow=xtls-rprx-vision&security=rea
 cdn add 'tuic://UUID:PASSWORD@IP:PORT?sni=目标站点&congestion_control=bbr&security=tls&udp_relay_mode=native&alpn=h3&allow_insecure=1'
 ```
 
-每条 `cdn add` 会自动校验 → 写入 nodes.txt → 重新渲染 config.dae → 重启 dae。
+每条 `cdn add` 会自动校验 → 写入 nodes.list → 重新渲染 config.dae → 重启 dae。
 
 节点失效后的更换流程：
 
@@ -121,8 +121,9 @@ cdn add 'vless://UUID@新IP:端口?…'
 
 ## 订阅 demo（占位 URL，换节点只改远端）
 
-> 订阅 URL 仍是**占位符**。本项目渲染的 `my_group` **不带 filter**，订阅拉下来的
-> 节点和手动 `cdn add` 的节点都在同一个组里参与选路（`min` 探活 + 失效自动剔除）。
+> 订阅 URL 仍是**占位符**。本项目渲染的分流组（`cdn_cache_group` /
+> `cdn_geoip_group`）**不带 filter**，订阅拉下来的节点和手动 `cdn add` 的节点
+> 都同时进入两个组参与选路（`min` 探活 + 失效自动剔除）。
 
 ```bash
 # 加订阅（可带标签；标签仅字母数字 _ -）
@@ -150,13 +151,18 @@ subscription {
 ```
 
 要不要锁死某订阅进特定组（subtag filter）：本项目当前不渲染 `filter`，
-订阅 + 手动节点的**全量**都在 `my_group` 里，这是刻意的——避免你把流量
-人为切分后失去「1 组 N 成员」的自动容灾。
+订阅 + 手动节点的**全量**都进入两个分流组（`cdn_cache_group` / `cdn_geoip_group`），
+这是刻意的——避免你把流量人为切分后失去「N 节点自动容灾」。
 
-## 组策略（my_group，建议保持默认）
+## 分流组（cdn_cache_group / cdn_geoip_group）
 
-> 所有 CDN 节点都在同一个组 `my_group` 里（不管加 1 个还是 3 个，
-> 都是「1 组 N 成员」）。组策略决定 dae 在成员之间怎么选。
+> 脚本渲染**两个分流组**，共享同一节点池（`node`/`subscription` 段的所有节点）：
+>
+> - `cdn_cache_group` —— 命中本地 CDN 网段缓存（`dip('cidr',...)` 首层规则）
+> - `cdn_geoip_group` —— 未命中缓存、命中 `geoip.dat` 的 `cdnip` 标签
+>
+> 两组策略一致（默认 `min`），拆分仅为了让**日志里 `outbound=` 字段一眼可辨
+> 流量是"命中 CDN 缓存"还是"命中 geoip"**，并分别显示所用节点（`dialer=`）。
 >
 > **建议：保持默认 `min`，不做任何配置。** 只有当节点间反复横跳
 > （流量在 2~3 个节点来回抖动）时，才考虑切 `min_moving_avg`。
@@ -176,13 +182,33 @@ export cdn_policy='min_moving_avg'
 cdn apply
 ```
 
+## 分流日志（默认开启，统一一个文件）
+
+`cdn log` 直接读取 **统一日志文件** `/var/log/dae/dae.log`（dae 服务以
+`--logfile` 写入，自动轮转 30MB×3），`log_level` 默认 `debug`，**每个连接
+都有一条明细**，形如：
+
+```text
+DEBUG 10.0.11.111:36196 <-> 198.41.192.7:7844 dialer=小叮当-…-vless-reality-SJE1Y4K … outbound=cdn_cache_group pname=cloudflared …
+DEBUG 2603:c021:…:41614 <-> www.cloudflare.com:443 dialer=小叮当-…-tuic-SJE1Y4K … outbound=cdn_geoip_group pname=curl sniffed=www.cloudflare.com
+```
+
+含义：**访问 `www.cloudflare.com:443` → `outbound=cdn_cache_group`
+（命中 CDN 缓存）→ `dialer=…-tuic-SJE1Y4K`（实际走的 tuic 节点）**。
+`outbound=cdn_geoip_group` 表示命中 geoip:cdnip；`outbound=direct` 表示直连。
+
+可用 `cdn_log_level` 调低级别（如 `info`）减少输出，日志文件路径用
+`DAE_LOG_FILE` 覆盖；`cdn status` 也会显示当前日志文件位置。
+
 ## 环境变量
 
 | 变量 | 说明 |
 |---|---|
 | `node1..nodeN` | `install` 时预填节点链接 |
 | `sub1..subN` | `install` 时预填订阅链接 |
-| `cdn_policy` | `my_group` 节点选择策略（`min` 默认 / `random` / `min_avg10` / `min_moving_avg` / `fixed(0)`…） |
+| `cdn_policy` | 分流组节点选择策略（`min` 默认 / `random` / `min_avg10` / `min_moving_avg` / `fixed(0)`…，`cdn_cache_group`/`cdn_geoip_group` 共用） |
+| `cdn_log_level` | dae 日志级别（默认 `debug`，输出每连接"访问目标 + 所用节点"分流明细） |
+| `DAE_LOG_FILE` | 统一日志文件路径（默认 `/var/log/dae/dae.log`，服务以 `--logfile` 写入，`cdn log` 读取） |
 | `cdn_geoip_url` | 自定义 geoip.dat 下载地址（默认社区 cdnip 版） |
 | `cdn_geoip_sha_url` | 自定义 sha256 校验文件地址（默认 `${cdn_geoip_url}.sha256sum`） |
 | `cdn_skip_geo` | `1` 时跳过 geoip 下载（须已放置 `/usr/local/share/dae/geoip.dat`） |
@@ -191,18 +217,41 @@ cdn apply
 | `cdn_skip_cdnip` | `1` 时跳过 CDN 网段缓存（降级为仅 geoip 判定） |
 | `cdn_force` | `1` 时强制重装（`cdn update` 内部使用） |
 | `CDN_DAE_VERSION_URL` | 自定义 dae 版本查询接口（默认 GitHub API） |
+| `cdnt` | `install.sh` 专用：设为任意非空值即安装后自动初始化（等价于再执行一次 `cdn`，内部调 `cdn install`） |
 
 ## 离线说明
 
 7 个 CDN 网段 txt（`1-cfcdn-ip-15.txt` ~ `5-akamai-ip-113.txt`）已**打包进发布包**，
 `install.sh` 解包时自动落盘到 `/usr/local/share/dae/cdnip/`。`cdn install` / `cdn update`
-**离线优先**读取本地随包清单生成 ipcidr 规则，即使 GCP 实例无法访问 GitHub 也能完整工作；
+**离线优先**读取本地随包清单生成 `dip(CIDR,...)` 规则，即使 GCP 实例无法访问 GitHub 也能完整工作；
 仅当本地清单缺失时才回退在线拉取。
 
 ## 前提
 
-- GCP Debian/Ubuntu 实例（dae 需要 root + 完整内核，**容器内不支持**）
+- GCP Debian/Ubuntu 实例（dae 需要 root + 完整内核）
 - 内核需开启 BTF（`CONFIG_DEBUG_INFO_BTF`），否则 eBPF 可能加载失败
+
+### 容器环境不支持（重要）
+
+dae 是 eBPF 透明代理，运行依赖内核的 `bpf()` 系统调用。**LXC / Docker / Podman /
+OpenVZ / systemd-nspawn 等容器环境不支持运行 dae**，原因：
+
+- 容器内 `bpf()` 系统调用通常被宿主禁止（返回 `EPERM`），eBPF 程序与 map 均无法创建；
+- dae 启动时会尝试提升 `RLIMIT_MEMLOCK`，容器内同样会被拒绝，
+  实测报错：`FATAL rlimit.RemoveMemlock: failed to set memlock rlimit: operation not permitted`；
+- 即使容器共享宿主内核并持有全部 capability，eBPF 能力仍由宿主控制，容器内无法获取。
+
+`cdn install` 会在安装前通过 `cdn_check_container` 检测运行环境：优先使用
+`systemd-detect-virt`；无该命令时（如 Alpine）回退读取 `/proc/1/environ` 的
+`container=` 标记（LXC 容器 PID 1 环境含 `container=lxc`）。命中容器白名单
+（openvz / lxc / docker / podman / ...）即拒绝安装并提示：
+
+```text
+[ERROR] 检测到容器运行时（lxc），dae（eBPF 透明代理）不支持容器内安装：容器内 bpf() 系统调用通常被禁，eBPF 无法加载。请改用 KVM/裸机 VPS。
+```
+
+> 实测：Alpine 3.22 LXC 容器内，安装步骤（dae 二进制 / geoip / 配置）均可正常完成，
+> 但 dae 服务启动即崩溃（bpf 被禁）。请使用 KVM/裸机 VPS（如 GCP 计算引擎实例）。
 
 ## 开发与发布
 

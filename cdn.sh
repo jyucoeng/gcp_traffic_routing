@@ -35,7 +35,11 @@ set -eEuo pipefail
 # 环境变量:
 #   node1..nodeN      install 时预填节点链接
 #   sub1..subN        install 时预填订阅链接
-#   cdn_policy        my_group 节点选择策略（min/random/min_avg10/min_moving_avg/fixed(0)...）
+#   cdn_policy        分流组节点选择策略（min/random/min_avg10/min_moving_avg/fixed(0)...，两个 CDN 分流组共用）
+#   cdn_log_level     dae 日志级别（默认 debug，输出每连接"访问目标 + 所用节点"明细，便于核对分流）
+#   DAE_LOG_FILE      统一日志文件路径（默认 /var/log/dae/dae.log，dae 全部日志经 --logfile 写入该文件）
+#   cdn_log_level     dae 日志级别（默认 debug，输出每连接分流明细：命中缓存/geoip 走了哪个节点）
+#   DAE_LOG_FILE      统一日志文件路径（默认 /var/log/dae/dae.log，dae 全部日志经 --logfile 写到此文件）
 #   cdn_geoip_url     自定义 geoip.dat 下载地址（默认社区 cdnip 版）
 #   cdn_geoip_sha_url 自定义 sha256 校验文件地址（默认 "${cdn_geoip_url}.sha256sum"）
 #   cdn_skip_geo      跳过 geoip 下载（仅当你已自行放置 /usr/local/share/dae/geoip.dat）
@@ -55,7 +59,7 @@ set -eEuo pipefail
 # 无 VERSION 时回退到下方字面量。字面量必须以版本门禁 check-version.sh 钉死为：
 #   "v${SCRIPT_VERSION}" 恒等于 VERSION 文件内容
 # （发布脚本会据此在构建/门禁阶段校验二者一致，此处仅为独立安装兜底）。
-SCRIPT_VERSION="0.1.1"
+SCRIPT_VERSION="0.1.2"
 if [ -s "$(dirname "${BASH_SOURCE[0]}")/VERSION" ]; then
   SCRIPT_VERSION="$(tr -d '\r\n' <"$(dirname "${BASH_SOURCE[0]}")/VERSION")"
   SCRIPT_VERSION="${SCRIPT_VERSION#v}"
@@ -90,12 +94,23 @@ CDN_GEOIP_MIRROR="https://cdn.jsdelivr.net/gh/fatekey/gcp_free@master/geoip.dat"
 # **离线优先**读取本地清单，断网也无需访问 GitHub；仅当本地清单缺失时才回退在线
 # 拉取 ${CDN_CDNIP_BASE}（若不缺则零网络依赖）。对应 Cloudflare/Fastly/Akamai 的
 # v4+v6 官方网段，每行为一条逗号/换行分隔的 CIDR 列表。
-# render 时生成 dip(ipcidr(...)) 规则并置于 dip(geoip:cdnip) 之前：
+# render 时生成 dip(cidr,...) 规则并置于 dip(geoip:cdnip) 之前：
 #   命中该缓存 -> 直接走 CDN 组；未命中 -> 继续查 geoip.dat(cdnip)。
 CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 CDN_CDNIP_BASE="${CDN_CDNIP_BASE:-https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main}"
 CDN_CDNIP_FILES="${CDN_CDNIP_FILES:-1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastly-ipv6-2.txt 3-akamai_ipv6-64.txt 4-akamai-ip-255.txt 5-akamai-ip-113.txt}"
 CDN_CDNIP_CACHE="${CDN_CDNIP_CACHE:-${DAE_DATA_DIR}/cdnip.txt}"
+
+# 分流日志：dae 支持 --logfile 把全部日志（含每连接 DEBUG 明细）写到统一文件。
+# cdn_log_level 控制 dae log_level（默认 debug 以便核对"命中 CDN 缓存/geoip 分流到哪个节点"）；
+# DAE_LOG_FILE 为统一日志文件路径（systemd/openrc 服务均以 --logfile 输出到该文件）。
+CDN_LOG_LEVEL="${cdn_log_level:-debug}"
+DAE_LOG_FILE="${DAE_LOG_FILE:-/var/log/dae/dae.log}"
+# 分流目标组（组名出现在 dae 日志 outbound= 字段，一眼可辨命中哪一层）：
+#   cdn_cache_group —— 命中本地 CDN 网段缓存（dip('cidr'...) 首层规则）
+#   cdn_geoip_group —— 未命中缓存、命中 geoip.dat 的 cdnip 标签
+CDN_CACHE_GROUP="cdn_cache_group"
+CDN_GEOIP_GROUP="cdn_geoip_group"
 
 # 颜色输出（非 TTY 或 NO_COLOR 时禁用）
 supports_color() {
@@ -157,6 +172,8 @@ sha256_str() {
     out="$(printf '%s' "$1" | sha256sum 2>/dev/null)"
   elif command_exists shasum; then
     out="$(printf '%s' "$1" | shasum -a 256 2>/dev/null)"
+  elif command_exists openssl; then
+    out="$(printf '%s' "$1" | openssl dgst -sha256 2>/dev/null)"
   fi
   printf '%s' "${out}" | awk '{print $1}'
 }
@@ -181,14 +198,23 @@ detect_init_system() {
 }
 
 # dae 基于 eBPF，容器内无法运行（与参考安装脚本同款容器白名单判定）
+# Alpine 无 systemd-detect-virt，因此额外读取 /proc/1/environ 的 container= 标记
+# （LXC 等容器 PID1 环境含 container=lxc；实测 bpf() 在容器内返回 EPERM）。
 cdn_check_container() {
   local virt=""
   if command_exists systemd-detect-virt; then
     virt="$(systemd-detect-virt 2>/dev/null || true)"
   fi
+  if [ -z "${virt}" ] && [ -r /proc/1/environ ]; then
+    virt="$(tr '\0' '\n' < /proc/1/environ 2>/dev/null | sed -n 's/^container=\([A-Za-z0-9_-]*\).*/\1/p' | head -n1 || true)"
+  fi
+  # 测试钩子：供 tests 注入虚拟化类型做函数级验证
+  if [ -n "${CDN_FAKE_VIRT:-}" ]; then
+    virt="${CDN_FAKE_VIRT}"
+  fi
   case "${virt}" in
-  openvz | lxc | lxc-libvirt | wsl | docker | podman | systemd-nspawn | proot | rkt | rouch)
-    cdn_fatal "检测到容器运行时（${virt}），dae（eBPF 透明代理）不支持容器内安装。"
+  openvz | lxc | lxc-libvirt | wsl | docker | podman | systemd-nspawn | proot | rkt | runc)
+    cdn_fatal "检测到容器运行时（${virt}），dae（eBPF 透明代理）不支持容器内安装：容器内 bpf() 系统调用通常被禁（EPERM），eBPF 无法加载。请改用 KVM/裸机 VPS。"
     ;;
   esac
 }
@@ -253,6 +279,7 @@ cdn_install_binary() {
     cdn_print_info "dae 已安装：$("${DAE_BIN}" --version 2>/dev/null | head -n1)"
     return 0
   fi
+  command_exists unzip || cdn_fatal "缺少解压工具 unzip，请先安装（Debian/Ubuntu: apt-get install -y unzip；Alpine: apk add unzip）。"
   ver="$(cdn_latest_version)"
   tmp="$(mktemp -d)"
   trap 'rm -rf "${tmp:-}"' EXIT
@@ -369,7 +396,7 @@ cdn_read_bundled_cdnip() {
 }
 
 # 生成/刷新 CDN 网段缓存（逗号/换行分隔 CIDR，含 v4+v6），
-# 供 render 生成 ipcidr 规则作为 geoip.dat 之前的第一层命中判定。
+# 供 render 生成 dip(CIDR,...) 规则作为 geoip.dat 之前的第一层命中判定。
 # 离线优先：先读随包安装的本地清单；本地缺失时才在线拉取。
 # 失败仅告警不中断：降级为纯 geoip(cdnip) 判定。
 cdn_fetch_cdnip() {
@@ -416,7 +443,7 @@ cdn_fetch_cdnip() {
       cdn_print_warn "忽略非法网段：${cidr}"
     fi
   done <<<"${raw}"
-  [ "${#out[@]:-0}" -gt 0 ] || {
+  [ "${#out[@]}" -gt 0 ] || {
     cdn_print_warn "CDN 网段清单全部非法，降级为仅使用 geoip.dat（cdnip）判定。"
     return 0
   }
@@ -425,11 +452,25 @@ cdn_fetch_cdnip() {
   cdn_print_ok "CDN 网段清单已缓存（$(wc -l <"${CDN_CDNIP_CACHE}") 条）：${CDN_CDNIP_CACHE}"
 }
 
-# 从缓存生成 dip(ipcidr(...)) 规则行（每行至多 25 条 CIDR），
+# 将 CIDR 列表拼接为 'a','b',... 形式（dae v2 语法：IPv6 必须引号，全部统一加引号）
+cdn_join_cidrs() {
+  local j="" c
+  for c in "$@"; do
+    [ -n "${j}" ] && j="${j},"
+    j="${j}'${c}'"
+  done
+  printf '%s' "${j}"
+}
+
+# 从缓存生成 dip(CIDR,...) 规则行（每行至多 25 条 CIDR），
 # 由 render 插入在 dip(geoip:cdnip) 之前：先命中缓存，未命中再查 geoip。
+# 注意：dae v2 的 dip() 直接接受 CIDR 列表（dip(101.97.0.0/16, 8.8.8.8)），
+# 不存在 ipcidr() 函数；且其配置语法裸字面量不含 ':'，IPv6 CIDR 必须
+# 用单引号包裹（dip('2001:db8::/32')），此处对全部 CIDR 统一加引号。
+# 纯函数：缓存缺失时直接输出空（不在此触发下载/写盘），
+# 缓存由 cdn_apply/cdn_install 在写盘前显式经 cdn_fetch_cdnip 生成。
 cdn_ipcidr_rules() {
   local group=() n=0 cidr
-  [ -s "${CDN_CDNIP_CACHE}" ] || cdn_fetch_cdnip >/dev/null 2>&1 || true
   [ -s "${CDN_CDNIP_CACHE}" ] || return 0
   while IFS= read -r cidr; do
     [ -z "${cidr}" ] && continue
@@ -437,19 +478,24 @@ cdn_ipcidr_rules() {
     group+=("${cidr}")
     n=$((n + 1))
     if [ "${n}" -ge 25 ]; then
-      printf '    dip(ipcidr(%s)) -> my_group\n' "$(IFS=,; printf '%s' "${group[*]}")"
+      printf '    dip(%s) -> %s\n' "$(cdn_join_cidrs "${group[@]}")" "${CDN_CACHE_GROUP}"
       group=() n=0
     fi
   done <"${CDN_CDNIP_CACHE}"
   if [ "${n}" -gt 0 ]; then
-    printf '    dip(ipcidr(%s)) -> my_group\n' "$(IFS=,; printf '%s' "${group[*]}")"
+    printf '    dip(%s) -> %s\n' "$(cdn_join_cidrs "${group[@]}")" "${CDN_CACHE_GROUP}"
   fi
 }
 
 # 自动探测 LAN 接口：存在 docker 网桥（docker0/br-*，参考实现同款）时绑定，否则留空
 cdn_detect_lan_iface() {
-  local dir oper
-  for dir in docker0 /sys/class/net/br-*; do
+  local cand dir oper
+  for cand in docker0 /sys/class/net/br-*; do
+    if [ "${cand}" != "docker0" ]; then
+      dir="$(basename "${cand}")"
+    else
+      dir="${cand}"
+    fi
     [ -d "/sys/class/net/${dir}" ] || continue
     oper="$(cat "/sys/class/net/${dir}/operstate" 2>/dev/null || true)"
     if [ "${oper:-down}" = "up" ]; then
@@ -521,7 +567,7 @@ cdn_render_config() {
   subs="$(cdn_read_subs)"
 
   printf 'global {\n'
-  printf '    log_level: info\n'
+  printf '    log_level: %s\n' "${CDN_LOG_LEVEL}"
   printf '    wan_interface: auto\n'
   if [ -n "${lan}" ]; then
     printf '    lan_interface: %s\n' "${lan}"
@@ -541,15 +587,20 @@ cdn_render_config() {
   printf '    }\n'
   printf '}\n'
   printf 'group {\n'
-  printf '    my_group {\n'
+  # 两个分流组共享同一节点池（node/subscription 段），仅在日志 outbound= 字段区分命中来源：
+  # cdn_cache_group=命中本地 CDN 网段缓存，cdn_geoip_group=命中 geoip.dat(cdnip)
+  printf '    %s {\n' "${CDN_CACHE_GROUP}"
+  printf '        policy: %s\n' "${policy}"
+  printf '    }\n'
+  printf '    %s {\n' "${CDN_GEOIP_GROUP}"
   printf '        policy: %s\n' "${policy}"
   printf '    }\n'
   printf '}\n'
   printf 'routing {\n'
   printf '    pname(NetworkManager) -> direct\n'
-  printf '    # 第一层：在线 CDN 网段缓存命中即走 CDN 组（未命中再查 geoip.dat）\n'
+  printf '    # 第一层：本地 CDN 网段缓存命中即走 CDN 组（未命中再查 geoip.dat）\n'
   cdn_ipcidr_rules
-  printf '    dip(geoip:cdnip) -> my_group\n'
+  printf '    dip(geoip:cdnip) -> %s\n' "${CDN_GEOIP_GROUP}"
   printf '\n'
   printf '    fallback: direct\n'
   printf '}\n'
@@ -583,7 +634,7 @@ cdn_write_config() {
   mkdir -p "$(dirname "${CDN_CONF}")"
   tmp="$(mktemp /tmp/cdnconfig.XXXXXX.dae)"
   cdn_render_config >"${tmp}"
-  if grep -qE "^\s*'vless://|^\s*'trojan://|^\s*sub_[0-9]+:|^\s*[A-Za-z0-9_-]+: 'https?://" "${tmp}"; then
+  if grep -qE "^\s*'(vless|vmess|trojan|hysteria2|tuic|anytls)://|^\s*sub_[0-9]+:|^\s*[A-Za-z0-9_-]+: 'https?://" "${tmp}"; then
     has_content=1
   fi
   if [ "${has_content:-0}" = "1" ] && [ -x "${DAE_BIN}" ]; then
@@ -601,8 +652,10 @@ cdn_write_config() {
 }
 
 cdn_create_service() {
+  # 统一日志文件所在目录（dae --logfile 需父目录存在）
+  mkdir -p "$(dirname "${DAE_LOG_FILE}")" 2>/dev/null || true
   if [ "${INIT_SYSTEM}" = "systemd" ]; then
-    if [ ! -f "${CDN_SYSTEMD_FILE}" ]; then
+    if [ ! -f "${CDN_SYSTEMD_FILE}" ] || ! grep -q -- "--logfile" "${CDN_SYSTEMD_FILE}" 2>/dev/null; then
       cat >"${CDN_SYSTEMD_FILE}" <<EOF
 [Unit]
 Description=dae transparent proxy (CDN traffic split)
@@ -611,7 +664,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${DAE_BIN} run -c ${CDN_CONF}
+ExecStart=${DAE_BIN} run -c ${CDN_CONF} --logfile ${DAE_LOG_FILE} --logfile-maxsize 30 --logfile-maxbackups 3
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -625,13 +678,13 @@ EOF
       cdn_print_ok "systemd 服务已创建：${CDN_SERVICE}.service"
     fi
   elif [ "${INIT_SYSTEM}" = "openrc" ]; then
-    if [ ! -f "${CDN_OPENRC_FILE}" ]; then
+    if [ ! -f "${CDN_OPENRC_FILE}" ] || ! grep -q -- "--logfile" "${CDN_OPENRC_FILE}" 2>/dev/null; then
       cat >"${CDN_OPENRC_FILE}" <<EOF
 #!/sbin/openrc-run
 name="${CDN_SERVICE}"
 description="dae transparent proxy (CDN traffic split)"
 command="${DAE_BIN}"
-command_args="run -c ${CDN_CONF}"
+command_args="run -c ${CDN_CONF} --logfile ${DAE_LOG_FILE} --logfile-maxsize 30 --logfile-maxbackups 3"
 pidfile="/run/${CDN_SERVICE}.pid"
 command_background="true"
 rc_ulimit="-n 65535"
@@ -646,21 +699,6 @@ EOF
   fi
 }
 
-cdn_service_start() {
-  case "${INIT_SYSTEM}" in
-  systemd)
-    systemctl enable --now "${CDN_SERVICE}"
-    ;;
-  openrc)
-    rc-update add "${CDN_SERVICE}" default >/dev/null 2>&1 || true
-    rc-service "${CDN_SERVICE}" start
-    ;;
-  *)
-    cdn_print_warn "未检测到 systemd/openrc，跳过开机自启。"
-    ;;
-  esac
-}
-
 cdn_restart_service() {
   case "${INIT_SYSTEM}" in
   systemd)
@@ -668,6 +706,9 @@ cdn_restart_service() {
     systemctl restart "${CDN_SERVICE}"
     ;;
   openrc)
+    # 与 systemd 分支对齐：apply 路径也要注册开机自启，否则 cdn add 自动 apply
+    # 后服务只重启不入 rc-update，重启机器即失效
+    rc-update add "${CDN_SERVICE}" default >/dev/null 2>&1 || true
     rc-service "${CDN_SERVICE}" restart
     ;;
   *)
@@ -717,12 +758,18 @@ cdn_status() {
     echo -e "服务: ${CDN_SERVICE}（无服务管理器）"
     ;;
   esac
-  echo -e "配置: ${CDN_CONF}（dip(geoip:cdnip) -> my_group）"
+  echo -e "配置: ${CDN_CONF}（${CDN_CACHE_GROUP}=CDN缓存 / ${CDN_GEOIP_GROUP}=geoip:cdnip，其余直连）"
+  echo -e "日志文件: ${DAE_LOG_FILE}"
   echo -e "节点文件: ${CDN_NODES}$( [ -f "${CDN_NODES}" ] && echo "（$(cdn_read_nodes | wc -l | tr -d ' ') 条）" || echo '（空）' )"
   echo -e "订阅文件: ${CDN_SUBS}$( [ -f "${CDN_SUBS}" ] && echo "（$(cdn_read_subs | wc -l | tr -d ' ') 条）" || echo '（空）' )"
 }
 
 cdn_log() {
+  # 优先读取统一日志文件（服务以 --logfile 输出，含每连接 DEBUG 明细，便于核对分流）
+  if [ -s "${DAE_LOG_FILE}" ]; then
+    tail -n 50 "${DAE_LOG_FILE}"
+    return 0
+  fi
   if [ "${INIT_SYSTEM:-}" = "" ]; then
     detect_init_system
   fi
@@ -731,7 +778,7 @@ cdn_log() {
     journalctl -u "${CDN_SERVICE}" -n 50 --no-pager 2>/dev/null || journalctl -n 50 --no-pager 2>/dev/null || true
     ;;
   *)
-    cdn_print_warn "当前无 journalctl，请在 /var/log 或 dae 日志中查看。"
+    cdn_print_warn "未找到统一日志文件（${DAE_LOG_FILE}），请检查 dae 服务是否已启动。"
     ;;
   esac
 }
@@ -829,7 +876,7 @@ cdn_add_impl() {
     if [ "${bad}" = "0" ]; then
       mkdir -p "${CDN_DIR}"
       : >>"${CDN_SUBS}"
-      if grep -qxF "${url}" "${CDN_SUBS}" || grep -qF ":${url}" "${CDN_SUBS}"; then
+      if grep -qxF "${url}" "${CDN_SUBS}" || { [ -n "${label}" ] && grep -qxF "${label}:${url}" "${CDN_SUBS}"; }; then
         cdn_print_info "订阅已存在，跳过：$(cdn_mask_sub "${url}")"
       else
         printf '%s\n' "${label:+${label}:}${url}" >>"${CDN_SUBS}"
@@ -852,18 +899,32 @@ cdn_add_impl() {
 cdn_del_impl() {
   local kind="$1"
   local key="$2"
-  local file
+  local file line tmp i=0 idx_target=0 found=0
   if [ "${kind}" = "node" ]; then
     file="${CDN_NODES}"
   else
     file="${CDN_SUBS}"
   fi
   [ -f "${file}" ] || cdn_fatal "无可用${kind}列表（缺少 ${file}）。"
-  local line tmp found=0 i=0
+  [ -n "${key}" ] || cdn_fatal "匹配条件不能为空。"
+  # 两阶段匹配：数字 key 先全文件找序号（与 cdn list 编号对齐，跳过空行），
+  # 无对应序号时回退为关键字匹配；非数字 key 直接按关键字。
+  if is_num "${key}"; then
+    while IFS= read -r line || [ -n "${line}" ]; do
+      [ -z "${line}" ] && continue
+      i=$((i + 1))
+      if [ "$((10#${key}))" = "${i}" ]; then
+        idx_target="${i}"
+        break
+      fi
+    done <"${file}"
+  fi
   tmp="$(mktemp)"
+  i=0
   while IFS= read -r line || [ -n "${line}" ]; do
+    [ -z "${line}" ] && continue
     i=$((i + 1))
-    if [ "${found}" = "0" ] && { { is_num "${key}" && [ "${key}" = "${i}" ]; } || { ! is_num "${key}" && printf '%s' "${line}" | grep -qiF "${key}"; }; }; then
+    if [ "${found}" = "0" ] && { { [ "${idx_target}" -gt 0 ] && [ "${idx_target}" = "${i}" ]; } || { [ "${idx_target}" -eq 0 ] && printf '%s' "${line}" | grep -qiF "${key}"; }; }; then
       cdn_print_ok "已删除${kind} [$i]：$( [ "${kind}" = "node" ] && cdn_mask_link "${line}" || echo "${line%%:*}" )"
       found=1
       continue
@@ -901,12 +962,13 @@ cdn_apply() {
     return 0
   fi
   [ -x "${DAE_BIN}" ] || cdn_fatal "dae 未安装，先执行：cdn install"
+  cdn_fetch_cdnip
   if ! cdn_write_config; then
     cdn_fatal "配置生成/校验失败，服务未变更。"
   fi
   cdn_create_service
   cdn_restart_service
-  cdn_print_ok "CDN 分流配置已生效（cdnip 网段缓存 + dip(geoip:cdnip) -> my_group，其余直连）。"
+  cdn_print_ok "CDN 分流配置已生效（${CDN_CACHE_GROUP}=CDN缓存命中 + ${CDN_GEOIP_GROUP}=geoip:cdnip，其余直连，日志：${DAE_LOG_FILE}）。"
 }
 
 cdn_install() {
@@ -942,6 +1004,7 @@ cdn_install() {
 cdn_update() {
   require_root
   detect_init_system
+  cdn_check_container
   cdn_check_btf
   cdn_arch_candidates
   cdn_force=1 cdn_install_binary
@@ -1000,7 +1063,7 @@ cdn_uninstall() {
 
 cdn_menu_nodes() {
   local links=() line
-  cdn_print_info "请输入 vless:// 或 trojan:// 节点链接（每行一个，空行结束）："
+  cdn_print_info "请输入节点链接（每行一个，空行结束；支持 vless/vmess/trojan/hysteria2/tuic/anytls）："
   while :; do
     if ! read -r -p "节点链接> " line || [ -z "${line}" ]; then
       break
@@ -1038,7 +1101,7 @@ menu_header() {
     echo " GCP自动分流CDN流量脚本(dae版)"
     echo " Author：${AUTHOR}"
     echo " Version: ${VERSION}"
-    echo " 快捷指令：${CDNR_NAME:-cdnr}"
+    echo " 快捷指令：cdn"
     echo "========================="
 }
 
@@ -1101,7 +1164,9 @@ print_usage() {
 
 环境变量:
   node1..nodeN / sub1..subN    install 时预填节点/订阅
-  cdn_policy          节点选择策略（默认 min）
+  cdn_policy          分流组节点选择策略（默认 min，两个 CDN 分流组共用）
+  cdn_log_level       dae 日志级别（默认 debug，便于核对每连接分流明细）
+  DAE_LOG_FILE        dae 统一日志文件路径（默认 /var/log/dae/dae.log，服务以 --logfile 写入）
   cdn_geoip_url / cdn_geoip_sha_url   自定义 geoip.dat 与校验地址
   cdn_skip_geo        跳过 geoip 下载（需自备 /usr/local/share/dae/geoip.dat）
   cdn_cdnip_bundled_dir  随包离线 CDN 网段清单目录（离线优先读取，默认 /usr/local/share/dae/cdnip）
