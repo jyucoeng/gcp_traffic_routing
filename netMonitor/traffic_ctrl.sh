@@ -603,8 +603,8 @@ menu_install_ask() {
             *) echo "提示：更换 TG 请用 4) 修改配置 或 set-tg，此处仅保留/清除。" ;;
         esac
     else
-        printf "TG Bot Token (留空不启用): "; read -rs _nt; echo
-        printf "TG Chat ID (留空不启用): "; read -rs _nc; echo
+        printf "TG Bot Token (输入不回显，留空不启用): "; read -rs _nt; echo
+        printf "TG Chat ID (留空不启用): "; read -r _nc
         if [ -n "$_nt" ] && [ -n "$_nc" ]; then
             TELEGRAM_BOT_TOKEN="$_nt"; TELEGRAM_CHAT_ID="$_nc"
             echo -e "  │→ TG 通知: \033[32m已启用\033[0m"
