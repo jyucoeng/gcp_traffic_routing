@@ -23,7 +23,7 @@
 `PLATFORM` 为小写标识（内置特殊处理 gcp/oracle，其他任意平台可用），用 `PLATFORM` 区分，无需维护多套文件。
 
 > **改配置统一通过子命令，勿手改配置文件。** 部署时全部参数固化到 **`/etc/traffic_routing/netMonitor.conf`**（权限 0600）。
-> 之后调上限/端口/网卡/TG/日志保留天数，运行 **`bash /root/traffic_ctrl.sh edit`**（交互式菜单），改完自动加密落盘并即时生效（无需重新部署）。
+> 之后调上限/端口/TG/日志保留天数，运行 **`bash /root/traffic_ctrl.sh edit`**（交互式菜单），改完自动加密落盘并即时生效（无需重新部署）。
 > **⚠️ TG 凭据不明文落盘**：`TELEGRAM_BOT_TOKEN_ENC` / `TELEGRAM_CHAT_ID_ENC` 为 AES-256 加密密文（密钥存 `/etc/traffic_routing/netMonitor.key`，权限 0600）。换凭据请用子命令 `set-tg`，不要手改密文。
 
 > **部署脚本建议下载到 VPS 本地保存**：封网后 VPS 断外网，但本地 `traffic_ctrl.sh` 仍可直接运行——可随时 `edit` 调配置、`set-tg` 换凭据、甚至**重新部署**（不依赖网络）。
@@ -313,10 +313,31 @@ USED_BAL=0
 
 ---
 
-## 五、封网后如何手动解锁 / 恢复
+## 五、封网确认与手动解锁 / 恢复
 
-每月 1 号 `reset_network.sh` 会自动恢复。
-如需手动立即解锁（只删本脚本的规则，不影响其他程序）。下面以 IPv4 为例，**纯 IPv6 机把 `iptables` 换成 `ip6tables` 执行；双栈机两者都执行**：
+### 1. 如何确认当前是否处于封网状态
+
+超限封网后现象：**SSH 正常（22 端口放行），但 `wget`/`curl` 外网失败**（如 `wget` 报 `unable to resolve host` / `failed: Try again`），这是符合预期的断网效果，不是 VPS 故障。
+
+```bash
+iptables -L INPUT -n | grep -c TRAFFIC_BLOCKED   # 1=封着，0=正常（双栈机再查 ip6tables 同一条）
+cat /var/lib/traffic_monitor/state | grep STATE  # blocked=封着，normal=正常
+```
+
+### 2. 解封（推荐用 reset 脚本）
+
+每月 1 号 `reset_network.sh` 会自动恢复。手动立即解封首选直接跑 reset 脚本（清防火墙 + 重置统计 + 写 archive，TG 恢复通知按规则发送）：
+
+```bash
+bash /root/traffic_routing/reset_network.sh
+# 验证：跳转条数归 0，外网恢复 200
+iptables -L INPUT -n | grep -c TRAFFIC_BLOCKED
+curl -s --max-time 10 -o /dev/null -w '%{http_code}\n' https://www.google.com
+```
+
+### 3. 解封（备用：手动删规则，只删本脚本的规则，不影响其他程序）
+
+reset 脚本不可用时才用。下面以 IPv4 为例，**纯 IPv6 机把 `iptables` 换成 `ip6tables` 执行；双栈机两者都执行**：
 ```bash
 iptables -D INPUT    -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
 iptables -D OUTPUT   -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
