@@ -1327,9 +1327,11 @@ mask_ip() {
 }
 
 get_ip_and_loc() {
-    local geo ip city cc loc masked
+    local geo ip city cc loc masked ipv4 ipv6
     geo=""
-    # 优先 ip-api.com (IPv4 定位)；纯 IPv6 或失败时走 ipwho.is (来源地址族自适应, 支持 v6)
+    # 双栈分别取：v4 走 ip-api（带定位），v6 走 ipwho.is/ipify（仅地址）；
+    # 单栈只取对应族；本机IP行按族拼接（双栈显示两个，单栈显示一个）
+    ipv4=""; ipv6=""
     if [ "\$HAS_V4" = "1" ]; then
         for _try in 1 2 3; do
             geo=\$(curl -s --max-time 5 "http://ip-api.com/json/?fields=query,countryCode,city" 2>/dev/null)
@@ -1352,22 +1354,58 @@ get_ip_and_loc() {
     cc=\$(echo "\$geo" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
     [ -z "\$cc" ] && cc=\$(echo "\$geo" | sed -n 's/.*"country_code":"\([^"]*\)".*/\1/p')
 
-    # 仍未取到 IP 时按地址族用 ipify 后备 (支持 v4/v6)
-    if [ -z "\$ip" ]; then
-        if [ "\$HAS_V6" = "1" ]; then
-            ip=\$(curl -6 -s --max-time 5 "https://api64.ipify.org" 2>/dev/null)
+    # 主 IP 归族：v4 格式进 ipv4，v6（含 ::）进 ipv6
+    case "\$ip" in
+        "") : ;;
+        *:* ) ipv6="\$ip" ;;
+        *) ipv4="\$ip" ;;
+    esac
+
+    # 定位互补：主查询无定位（v4 被墙/CF 盖住/unknown）且双栈时，用另一族补一次定位；
+    # 通知在封网前/解封后发送，此时外网可用，多一次请求可接受
+    if [ -z "\$city$cc" ] || [ "\$cc" = "unknown" ]; then
+        _geo2=""
+        case "\$ip" in
+            *:* )
+                [ "\$HAS_V4" = "1" ] && _geo2=\$(curl -s --max-time 5 "http://ip-api.com/json/?fields=query,countryCode,city" 2>/dev/null) ;;
+            *)
+                [ "\$HAS_V6" = "1" ] && _geo2=\$(curl -6 -s --max-time 5 "https://ipwho.is/" 2>/dev/null) ;;
+        esac
+        if [ -n "\$_geo2" ]; then
+            _c2=\$(echo "\$_geo2" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
+            _cc2=\$(echo "\$_geo2" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
+            [ -z "\$_cc2" ] && _cc2=\$(echo "\$_geo2" | sed -n 's/.*"country_code":"\([^"]*\)".*/\1/p')
+            [ -n "\$_c2" ] && city="\$_c2"
+            [ -n "\$_cc2" ] && cc="\$_cc2"
         fi
-        [ -z "\$ip" ] && ip=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
-    fi
-    # 外部查询全部失败时 (如封网断外网) 回退用本机网卡地址, 保证 IP 不至于空白
-    if [ -z "\$ip" ]; then
-        if [ "\$HAS_V4" = "1" ]; then
-            ip=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
-        fi
-        [ -z "\$ip" ] && ip=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
     fi
 
-    masked="\$ip"
+    # 双栈补取另一族地址：v4 已有则补 v6（ipify v6），v6 已有则补 v4（ipify v4）
+    if [ "\$HAS_V6" = "1" ] && [ -z "\$ipv6" ]; then
+        ipv6=\$(curl -6 -s --max-time 5 "https://api64.ipify.org" 2>/dev/null)
+    fi
+    if [ "\$HAS_V4" = "1" ] && [ -z "\$ipv4" ]; then
+        ipv4=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
+    fi
+    # 外部查询全部失败时 (如封网断外网) 回退用本机网卡地址, 保证 IP 不至于空白
+    if [ -z "\$ipv4" ] && [ "\$HAS_V4" = "1" ]; then
+        ipv4=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+    fi
+    if [ -z "\$ipv6" ] && [ "\$HAS_V6" = "1" ]; then
+        ipv6=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1 | cut -d% -f1)
+    fi
+
+    # 拼接展示：双栈 "v4 / v6"，单栈单个；masked 与 ip 同值（当前不打码）
+    if [ -n "\$ipv4" ] && [ -n "\$ipv6" ]; then
+        masked="\$ipv4 / \$ipv6"
+        ip="\$ipv4 / \$ipv6"
+    elif [ -n "\$ipv4" ]; then
+        masked="\$ipv4"
+        ip="\$ipv4"
+    else
+        masked="\$ipv6"
+        ip="\$ipv6"
+    fi
 
     # 定位降级: 城市-国家 / 国家 / unknown
     local loc
@@ -1840,8 +1878,11 @@ mask_ip() {
 }
 
 get_ip_and_loc() {
-    local geo ip city cc loc masked
+    local geo ip city cc loc masked ipv4 ipv6
     geo=""
+    # 双栈分别取：v4 走 ip-api（带定位），v6 走 ipwho.is/ipify（仅地址）；
+    # 单栈只取对应族；本机IP行按族拼接（双栈显示两个，单栈显示一个）
+    ipv4=""; ipv6=""
     # 优先 ip-api.com (IPv4 定位)；纯 IPv6 或失败时走 ipwho.is (来源地址族自适应, 支持 v6)
     if [ "\$HAS_V4" = "1" ]; then
         for _try in 1 2 3; do
@@ -1864,20 +1905,55 @@ get_ip_and_loc() {
     city=\$(echo "\$geo" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
     cc=\$(echo "\$geo" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
     [ -z "\$cc" ] && cc=\$(echo "\$geo" | sed -n 's/.*"country_code":"\([^"]*\)".*/\1/p')
-    if [ -z "\$ip" ]; then
-        if [ "\$HAS_V6" = "1" ]; then
-            ip=\$(curl -6 -s --max-time 5 "https://api64.ipify.org" 2>/dev/null)
+    # 主 IP 归族：v4 格式进 ipv4，v6（含 ::）进 ipv6
+    case "\$ip" in
+        "") : ;;
+        *:* ) ipv6="\$ip" ;;
+        *) ipv4="\$ip" ;;
+    esac
+    # 定位互补：主查询无定位（v4 被墙/CF 盖住/unknown）且双栈时，用另一族补一次定位；
+    # 通知在封网前/解封后发送，此时外网可用，多一次请求可接受
+    if [ -z "\$city$cc" ] || [ "\$cc" = "unknown" ]; then
+        _geo2=""
+        case "\$ip" in
+            *:* )
+                [ "\$HAS_V4" = "1" ] && _geo2=\$(curl -s --max-time 5 "http://ip-api.com/json/?fields=query,countryCode,city" 2>/dev/null) ;;
+            *)
+                [ "\$HAS_V6" = "1" ] && _geo2=\$(curl -6 -s --max-time 5 "https://ipwho.is/" 2>/dev/null) ;;
+        esac
+        if [ -n "\$_geo2" ]; then
+            _c2=\$(echo "\$_geo2" | sed -n 's/.*"city":"\([^"]*\)".*/\1/p')
+            _cc2=\$(echo "\$_geo2" | sed -n 's/.*"countryCode":"\([^"]*\)".*/\1/p')
+            [ -z "\$_cc2" ] && _cc2=\$(echo "\$_geo2" | sed -n 's/.*"country_code":"\([^"]*\)".*/\1/p')
+            [ -n "\$_c2" ] && city="\$_c2"
+            [ -n "\$_cc2" ] && cc="\$_cc2"
         fi
-        [ -z "\$ip" ] && ip=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
+    fi
+    # 双栈补取另一族地址：v4 已有则补 v6（ipify v6），v6 已有则补 v4（ipify v4）
+    if [ "\$HAS_V6" = "1" ] && [ -z "\$ipv6" ]; then
+        ipv6=\$(curl -6 -s --max-time 5 "https://api64.ipify.org" 2>/dev/null)
+    fi
+    if [ "\$HAS_V4" = "1" ] && [ -z "\$ipv4" ]; then
+        ipv4=\$(curl -4 -s --max-time 5 "https://api.ipify.org" 2>/dev/null)
     fi
     # 外部查询全部失败时 (如封网断外网) 回退用本机网卡地址, 保证 IP 不至于空白
-    if [ -z "\$ip" ]; then
-        if [ "\$HAS_V4" = "1" ]; then
-            ip=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
-        fi
-        [ -z "\$ip" ] && ip=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
+    if [ -z "\$ipv4" ] && [ "\$HAS_V4" = "1" ]; then
+        ipv4=\$(ip -4 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1)
     fi
-    masked="\$ip"
+    if [ -z "\$ipv6" ] && [ "\$HAS_V6" = "1" ]; then
+        ipv6=\$(ip -6 -o addr show 2>/dev/null | awk '\$2=="'"\$INTERFACE"'" {print \$4; exit}' | cut -d/ -f1 | cut -d% -f1)
+    fi
+    # 拼接展示：双栈 "v4 / v6"，单栈单个；masked 与 ip 同值（当前不打码）
+    if [ -n "\$ipv4" ] && [ -n "\$ipv6" ]; then
+        masked="\$ipv4 / \$ipv6"
+        ip="\$ipv4 / \$ipv6"
+    elif [ -n "\$ipv4" ]; then
+        masked="\$ipv4"
+        ip="\$ipv4"
+    else
+        masked="\$ipv6"
+        ip="\$ipv6"
+    fi
     local loc
     if [ -n "\$city" ] && [ -n "\$cc" ]; then
         loc="\${city}-\${cc}"
