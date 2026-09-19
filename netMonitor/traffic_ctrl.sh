@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.9}"
+VERSION="${VERSION:-v1.0.10}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -1453,6 +1453,24 @@ read_traffic
 # 计费口径换算成 GB (1 GB = 1073741824 Bytes)
 BAL_GB=\$(echo "scale=2; \$BAL_BYTES / 1073741824" | bc)
 
+# 上限括号换算：与 TG 超限通知同逻辑，按计费流量单位换算上限
+# （例：计费 8.07MB / 上限 500GB -> 流量上限: 500 GB (512000.00MB)）
+BAL_FMT="\$(format_traffic "\$BAL_BYTES")"
+BAL_UNIT="\$(printf '%s' "\$BAL_FMT" | grep -oE 'MB|GB|TB' | tail -n1)"
+LIMIT_DISPLAY_TERM="\$LIMIT GB"
+if [ -n "\${LIMIT:-}" ] && [ "\$LIMIT" != "0" ] && [ "\$LIMIT" != "-1" ] && [ -n "\$BAL_UNIT" ] && [ "\$BAL_UNIT" != "GB" ]; then
+    LIMIT_BYTES_TERM=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc 2>/dev/null)
+    case "\$BAL_UNIT" in
+        MB) LIMIT_DIV_TERM=1048576 ;;
+        TB) LIMIT_DIV_TERM=1099511627776 ;;
+        *)  LIMIT_DIV_TERM=1073741824 ;;
+    esac
+    case "\$LIMIT_BYTES_TERM" in ''|*[!0-9]*) : ;; *)
+        LIMIT_CONV_TERM="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES_TERM / \$LIMIT_DIV_TERM" | bc)") \$BAL_UNIT"
+        LIMIT_DISPLAY_TERM="\$LIMIT GB (\$LIMIT_CONV_TERM)" ;;
+    esac
+fi
+
 # ==========================================
 # 1. 终端直接输出 (显示精确数值)
 # ==========================================
@@ -1462,8 +1480,8 @@ echo " 当前时间    : \$(date '+%Y-%m-%d %H:%M:%S')"
 echo " 上行出站(TX): \$(format_traffic "\$MONTH_TX") (\$MONTH_TX Bytes)"
 echo " 下行入站(RX): \$(format_traffic "\$MONTH_RX") (\$MONTH_RX Bytes)"
 echo " 计费口径    : \$STAT_MODE (out=出站 in=入站 max=取大 min=取小 sum=总和)"
-echo " 计费流量    : \$(format_traffic "\$BAL_BYTES") (\$BAL_BYTES Bytes)"
-echo " 流量上限    : \$LIMIT GB"
+echo " 已用流量    : \$(format_traffic "\$BAL_BYTES") (\$BAL_BYTES Bytes)"
+echo " 流量上限    : \$LIMIT_DISPLAY_TERM"
 echo "========================================"
 
 # ==========================================
