@@ -1527,20 +1527,76 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 CPU: \$(get_cpu_type)"
     fi
 
-    # 本月流量/上限 恒显示 (重置已清零, 本月为 0); 有上月(重置前)记录时附加展示
-    # 上限换算: 本月流量恒为 0.00MB, 故上限统一换算成 MB 括号展示 (如 上限: 10 GB (10240.00MB))
-    LIMIT_MB_DISPLAY="\$LIMIT GB"
-    if [ -n "\$LIMIT" ] && [ "\$LIMIT" != "0" ] && [ "\$LIMIT" != "-1" ]; then
-        LIMIT_BYTES_RST=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc 2>/dev/null)
+    # 本月口径中文名 (与超限通知一致: sum-总和 / out-出站 / in-入站 / max-取大 / min-取小)
+    case "\$STAT_MODE" in
+        out) STAT_LABEL="out-出站" ;;
+        in)  STAT_LABEL="in-入站" ;;
+        max) STAT_LABEL="max-取大" ;;
+        min) STAT_LABEL="min-取小" ;;
+        *)   STAT_LABEL="sum-总和" ;;
+    esac
+    # 本月已用流量 (重置已清零, 恒为 0; 仍按口径算, 与超限通知同口径逻辑)
+    case "\$STAT_MODE" in
+        in)  BAL_CUR="\$MONTH_RX" ;;
+        out) BAL_CUR="\$MONTH_TX" ;;
+        max) [ "\$MONTH_TX" -ge "\$MONTH_RX" ] 2>/dev/null && BAL_CUR="\$MONTH_TX" || BAL_CUR="\$MONTH_RX" ;;
+        min) [ "\$MONTH_TX" -le "\$MONTH_RX" ] 2>/dev/null && BAL_CUR="\$MONTH_TX" || BAL_CUR="\$MONTH_RX" ;;
+        *)   BAL_CUR=\$(( MONTH_TX + MONTH_RX )) ;;
+    esac
+    USED_FMT_CUR="\$(format_traffic "\$BAL_CUR")"
+    USED_UNIT_CUR="\$(printf '%s' "\$USED_FMT_CUR" | grep -oE 'MB|GB|TB' | tail -n1)"
+    # 本月上限换算: 与超限通知同逻辑, 按本月已用单位换算 (本月恒 0MB -> 上限换算成 MB, 如 上限: 10 GB (10240.00MB))
+    LIMIT_BYTES_RST=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc 2>/dev/null)
+    LIMIT_DISPLAY_CUR="\$LIMIT GB"
+    if [ -n "\$USED_UNIT_CUR" ] && [ "\$USED_UNIT_CUR" != "GB" ]; then
+        case "\$USED_UNIT_CUR" in
+            MB) LIMIT_DIV_CUR=1048576 ;;
+            TB) LIMIT_DIV_CUR=1099511627776 ;;
+            *)  LIMIT_DIV_CUR=1073741824 ;;
+        esac
         case "\$LIMIT_BYTES_RST" in ''|*[!0-9]*) : ;; *)
-            LIMIT_MB_CONV="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES_RST / 1048576" | bc)")MB"
-            LIMIT_MB_DISPLAY="\$LIMIT GB (\$LIMIT_MB_CONV)" ;;
+            LIMIT_CONV_CUR="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES_RST / \$LIMIT_DIV_CUR" | bc)") \$USED_UNIT_CUR"
+            LIMIT_DISPLAY_CUR="\$LIMIT GB (\$LIMIT_CONV_CUR)" ;;
+        esac
+    fi
+    # 上月口径: 优先用 state 落盘的 USED_STAT_MODE (封网当时的口径), 缺失回退当前 STAT_MODE
+    LAST_STAT_MODE="\${USED_STAT_MODE:-\$STAT_MODE}"
+    case "\$LAST_STAT_MODE" in out|in|max|min|sum) : ;; *) LAST_STAT_MODE="\$STAT_MODE" ;; esac
+    case "\$LAST_STAT_MODE" in
+        out) LAST_STAT_LABEL="out-出站" ;;
+        in)  LAST_STAT_LABEL="in-入站" ;;
+        max) LAST_STAT_LABEL="max-取大" ;;
+        min) LAST_STAT_LABEL="min-取小" ;;
+        *)   LAST_STAT_LABEL="sum-总和" ;;
+    esac
+    # 上月已用流量 (按上月口径算, 与超限通知同口径逻辑)
+    case "\$LAST_STAT_MODE" in
+        in)  LAST_BAL="\$LAST_MONTH_RX" ;;
+        out) LAST_BAL="\$LAST_MONTH_TX" ;;
+        max) [ "\$LAST_MONTH_TX" -ge "\$LAST_MONTH_RX" ] 2>/dev/null && LAST_BAL="\$LAST_MONTH_TX" || LAST_BAL="\$LAST_MONTH_RX" ;;
+        min) [ "\$LAST_MONTH_TX" -le "\$LAST_MONTH_RX" ] 2>/dev/null && LAST_BAL="\$LAST_MONTH_TX" || LAST_BAL="\$LAST_MONTH_RX" ;;
+        *)   LAST_BAL=\$(( LAST_MONTH_TX + LAST_MONTH_RX )) ;;
+    esac
+    LAST_USED_FMT="\$(format_traffic "\$LAST_BAL")"
+    LAST_USED_UNIT="\$(printf '%s' "\$LAST_USED_FMT" | grep -oE 'MB|GB|TB' | tail -n1)"
+    # 上月上限换算: 与超限通知同逻辑, 按上月已用单位换算
+    LIMIT_DISPLAY_LAST="\$LIMIT GB"
+    if [ -n "\$LAST_USED_UNIT" ] && [ "\$LAST_USED_UNIT" != "GB" ]; then
+        case "\$LAST_USED_UNIT" in
+            MB) LIMIT_DIV_LAST=1048576 ;;
+            TB) LIMIT_DIV_LAST=1099511627776 ;;
+            *)  LIMIT_DIV_LAST=1073741824 ;;
+        esac
+        case "\$LIMIT_BYTES_RST" in ''|*[!0-9]*) : ;; *)
+            LIMIT_CONV_LAST="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES_RST / \$LIMIT_DIV_LAST" | bc)") \$LAST_USED_UNIT"
+            LIMIT_DISPLAY_LAST="\$LIMIT GB (\$LIMIT_CONV_LAST)" ;;
         esac
     fi
     LAST_MONTH_LINE=""
     if [ "\$LAST_MONTH_OK" = "1" ]; then
         LAST_MONTH_LINE="
-📊 上个月流量: 上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX") (重置前耗尽)"
+📊 上月计费口径: \$LAST_STAT_LABEL / 上限: \$LIMIT_DISPLAY_LAST
+🌐 上月已用流量: \$LAST_USED_FMT / (上行 \$(format_traffic "\$LAST_MONTH_TX") / 下行 \$(format_traffic "\$LAST_MONTH_RX")) (重置前耗尽)"
     fi
 
     TG_MSG="🎮 \$PLATFORM 流量报告（网络恢复通知）
@@ -1548,7 +1604,8 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 超限封网 ---> 已恢复
-🌐 本月流量: 上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX") / 上限: \$LIMIT_MB_DISPLAY\${LAST_MONTH_LINE}\${CPU_LINE}"
+📊 计费口径: \$STAT_LABEL / 上限: \$LIMIT_DISPLAY_CUR
+🌐 已用流量: \$USED_FMT_CUR / (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${LAST_MONTH_LINE}\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
     log "已发送网络恢复 TG 通知。"
