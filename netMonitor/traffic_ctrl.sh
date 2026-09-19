@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.8}"
+VERSION="${VERSION:-v1.0.9}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -360,13 +360,26 @@ tg_notify_reset() {
     fi
 }
 
-# 共用菜单头：一级/二级/config 统一（标题+作者+版本+网络状态+快捷指令）
+# 共用菜单头：一级/二级/config 统一（标题+作者+版本+网络状态+TG通知+快捷指令）
+# TG 行：conf 缺失=未部署(黄)；凭据齐=已启用(绿)；否则未启用(红)
+menu_tg_status() {
+    _cf="${CONF_FILE:-/etc/traffic_routing/netMonitor.conf}"
+    [ -f "$_cf" ] || { printf '\033[33m未部署\033[0m'; return 0; }
+    # shellcheck disable=SC1090
+    . "$_cf" 2>/dev/null || { printf '\033[31m未启用\033[0m'; return 0; }
+    if [ -n "${TELEGRAM_BOT_TOKEN_ENC:-}" ] && [ -n "${TELEGRAM_CHAT_ID_ENC:-}" ]; then
+        printf '\033[32m已启用\033[0m'
+    else
+        printf '\033[31m未启用\033[0m'
+    fi
+}
 menu_header() {
     echo "========================="
     echo " 小鸡流量限制管理脚本"
     echo " Author：${AUTHOR}"
     echo " Version: ${VERSION}"
     echo " 网络状态：$(menu_net_status)"
+    echo " TG 通知：$(menu_tg_status)"
     echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
     echo "========================="
 }
