@@ -179,21 +179,28 @@ quick_install() {
 # 保留项：NETMON_KEY（TG 凭据 AES 密钥，覆盖式重装复用，免重配 TG）与月度档案 archive（历史流量长期留存）。
 # ==================================================
 uninstall() {
+    echo "--> 正在卸载..."
     # 1. 从 crontab 移除本脚本的两条调度（只删含 check_traffic/reset_network 的行，保留其他任务）
     if command -v crontab >/dev/null 2>&1; then
         crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
+        echo "  -> 定时任务已清理。"
     fi
 
     # 2. 删除部署时生成的运行时脚本（SCRIPT_DIR；兼容清理旧版 /root 直放路径）与快捷指令
     rm -f "$SCRIPT_DIR/check_traffic.sh" "$SCRIPT_DIR/reset_network.sh" "$SCRIPT_DIR/netstat.sh" 2>/dev/null || true
     rm -f /root/check_traffic.sh /root/reset_network.sh /root/netstat.sh 2>/dev/null || true
-    rm -f "/usr/local/bin/${TFC_NAME:-tfc}" 2>/dev/null || true
+    if [ -e "/usr/local/bin/${TFC_NAME:-tfc}" ]; then
+        rm -f "/usr/local/bin/${TFC_NAME:-tfc}" 2>/dev/null || true
+        echo "  -> 快捷指令 ${TFC_NAME:-tfc} 已删除。"
+    fi
     rmdir "$SCRIPT_DIR" 2>/dev/null || true
+    echo "  -> 运行时脚本已清理。"
 
     # 3. 删除运行时配置（保留 NETMON_KEY：覆盖式重装复用 TG 密钥；兼容删旧版硬编码路径）
     [ -n "${CONF_FILE:-}" ] && rm -f "$CONF_FILE"
     rm -f /etc/netMonitor.conf 2>/dev/null || true
     [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
+    echo "  -> 运行时配置已清理（密钥保留）。"
 
     # 4. 清理本脚本的封网规则（只删自家 TRAFFIC_BLOCKED 链及跳转，不动其他程序规则/默认策略）
     for _FW in iptables ip6tables; do
@@ -206,6 +213,7 @@ uninstall() {
         "$_FW" -F TRAFFIC_BLOCKED 2>/dev/null || true
         "$_FW" -X TRAFFIC_BLOCKED 2>/dev/null || true
     done
+    echo "  -> 封网规则已清理，网络已恢复。"
 
     # 5. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
     # 卸载清除本月状态(state)与 TG 发送历史(notify)；本月流量计数(netcount)保留 --
@@ -213,6 +221,7 @@ uninstall() {
     rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/notify 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
     rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
+    echo "  -> 状态与日志已清理（月度档案保留）。"
 
     echo "  -> 已卸载（旧部署物已清理，密钥与月度档案保留；如需重新部署请直接 bash $0 执行覆盖式安装）。"
 }
@@ -516,6 +525,68 @@ menu_restore() {
         echo "未找到 reset_network.sh，请先部署（菜单 1）。"
     fi
 }
+# 脚本更新：从 GitHub 拉最新部署器，校验后覆盖 $0 与落盘副本、重建 tfc 链接，
+# 并自动重装以重生成 check/reset/netstat（配置/conf/cron 保留，即时生效）；可重复执行
+menu_update() {
+    _url="${UPDATE_URL:-https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh}"
+    _tmp="/tmp/traffic_ctrl.new"
+    echo "--> 正在下载最新脚本..."
+    if ! wget -O "$_tmp" "$_url" 2>&1 | tail -n2; then
+        echo "错误：下载失败（封网断外网时请先恢复网络，或检查 UPDATE_URL）。" >&2
+        rm -f "$_tmp"
+        return 1
+    fi
+    [ -s "$_tmp" ] || { echo "错误：下载文件为空。" >&2; rm -f "$_tmp"; return 1; }
+    bash -n "$_tmp" 2>/dev/null || { echo "错误：新脚本语法校验未通过，已丢弃。" >&2; rm -f "$_tmp"; return 1; }
+    case "$0" in
+        /dev/fd/*|/proc/self/fd/*) : ;;
+        *) [ -f "$0" ] && cp -f "$_tmp" "$0" ;;
+    esac
+    mkdir -p "$SCRIPT_DIR"
+    cp -f "$_tmp" "$SCRIPT_DIR/traffic_ctrl.sh"
+    chmod +x "$SCRIPT_DIR/traffic_ctrl.sh"
+    [ -f "$0" ] && [ "$0" != "$SCRIPT_DIR/traffic_ctrl.sh" ] && chmod +x "$0" 2>/dev/null || true
+    mkdir -p /usr/local/bin 2>/dev/null || true
+    ln -sf "$SCRIPT_DIR/traffic_ctrl.sh" "/usr/local/bin/${TFC_NAME:-tfc}"
+    rm -f "$_tmp"
+    echo "--> 脚本已更新（部署器 + ${TFC_NAME:-tfc} 链接），正在用原配置重装以重生成运行时..."
+    # 用原 conf 重装：读出原配置逐项透传（含 LIMIT/TG 明文解密），conf 缺失则提示手动安装
+    if [ -f "$CONF_FILE" ]; then
+        . "$CONF_FILE"
+        # dec_tg 在外层部署器可用；新脚本同名函数行为一致，直接复用
+        _tg_t="$(printf '%s\n' "${TELEGRAM_BOT_TOKEN_ENC:-}" | openssl enc -d -aes-256-cbc -pbkdf2 -a -pass file:"${NETMON_KEY:-$CONF_DIR/netMonitor.key}" 2>/dev/null)"
+        _tg_c="$(printf '%s\n' "${TELEGRAM_CHAT_ID_ENC:-}" | openssl enc -d -aes-256-cbc -pbkdf2 -a -pass file:"${NETMON_KEY:-$CONF_DIR/netMonitor.key}" 2>/dev/null)"
+        PLATFORM="${PLATFORM:-gcp}" LIMIT="${LIMIT:-}" STAT_MODE="${STAT_MODE:-sum}" SSH_PORT="${SSH_PORT:-22}" \
+        DNS_SERVERS="$DNS_SERVERS" LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}" \
+        TELEGRAM_BOT_TOKEN="$_tg_t" TELEGRAM_CHAT_ID="$_tg_c" \
+        SCRIPT_DIR="$SCRIPT_DIR" CONF_DIR="$CONF_DIR" CONF_FILE="$CONF_FILE" \
+        NETMON_KEY="$NETMON_KEY" TFC_NAME="${TFC_NAME:-tfc}" KEEP_TRAFFIC=1 \
+        bash "$SCRIPT_DIR/traffic_ctrl.sh" req
+    else
+        echo "--> 未找到 ${CONF_FILE}，跳过重装；请跑菜单 1 完成首次部署。"
+    fi
+}
+# 一级菜单网络状态行：绿●正常 / 红■封网中 / 黄○未部署（读 state + 防火墙跳转数）
+menu_net_status() {
+    _conf="${CONF_FILE:-/etc/traffic_routing/netMonitor.conf}"
+    _state="/var/lib/traffic_monitor/state"
+    if [ ! -f "$_conf" ]; then
+        printf '\033[33m○ 未部署\033[0m'
+        return 0
+    fi
+    _st="normal"
+    [ -f "$_state" ] && _st="$(sed -n 's/^STATE=//p' "$_state" 2>/dev/null | tail -n1)"
+    [ -n "$_st" ] || _st="normal"
+    _fw=0
+    if command -v iptables >/dev/null 2>&1; then
+        _fw="$(iptables -L INPUT -n 2>/dev/null | grep -c TRAFFIC_BLOCKED)"
+    fi
+    if [ "$_st" = "blocked" ] || [ "${_fw:-0}" -gt 0 ] 2>/dev/null; then
+        printf '\033[31m■ 封网中\033[0m（超限，SSH/DNS 可用）'
+    else
+        printf '\033[32m● 正常\033[0m'
+    fi
+}
 main_menu() {
     require_root
     while :; do
@@ -525,15 +596,15 @@ main_menu() {
         echo " Author：${AUTHOR}"
         echo " Version: ${VERSION}"
         echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
+        echo " 网络状态：$(menu_net_status)"
         echo "========================="
         echo " 1) 安装 / 覆盖安装"
         echo " 2) 查看当前配置"
-        echo " 3) 修改配置（交互菜单）"
-        echo " 4) 设置/更换 TG 凭据"
-        echo " 5) 停用 TG 通知（清除凭据）"
-        echo " 6) 查看流量"
-        echo " 7) 恢复网络"
-        echo " 8) 卸载"
+        echo " 3) 修改配置（交互菜单，含 TG）"
+        echo " 4) 查看流量"
+        echo " 5) 恢复网络"
+        echo " 6) 脚本更新"
+        echo " 7) 卸载"
         echo " 0) 退出"
         echo "========================="
         printf "请选择: "
@@ -550,28 +621,19 @@ main_menu() {
                 config_edit
                 ;;
             4)
-                printf "Bot Token (留空取消): "; read -rs t; echo
-                printf "Chat ID   (留空取消): "; read -rs _c; echo
-                if [ -n "$t" ] && [ -n "$_c" ]; then
-                    TELEGRAM_BOT_TOKEN="$t" TELEGRAM_CHAT_ID="$_c" tg_set
-                else
-                    echo "-> 未填写完整，已取消。"
-                fi
-                ;;
-            5)
-                tg_clear
-                ;;
-            6)
                 menu_check
                 ;;
-            7)
+            5)
                 printf "确认恢复网络？将清除封网规则并重置当月统计 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) menu_restore ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 ;;
-            8)
+            6)
+                menu_update
+                ;;
+            7)
                 printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) uninstall ;;
@@ -604,6 +666,7 @@ print_usage() {
   clear-tg         停用并清除 TG 凭据
   check            查看流量（跑 check_traffic.sh：查当月上下行 + 超限判定）
   restore          恢复网络（跑 reset_network.sh：清封网 + 重置统计）
+  update           脚本更新（从 GitHub 拉最新部署器，仅换文件不重装）
   del              卸载
   -h | --help | help  显示本帮助
 
@@ -841,9 +904,15 @@ case "${1:-}" in
 esac
 NETSTAT
 chmod +x "$SCRIPT_DIR/netstat.sh"
-# 立即初始化快照 (--reset：当月累计=0、快照=当前累计；此后每5分钟增量累计)
-"$SCRIPT_DIR/netstat.sh" --reset >/dev/null 2>&1 || true
-echo "--> 流量统计脚本已生成并初始化 (独立于 vnstat)。"
+# 快照初始化：全新部署时 --reset（当月累计=0、快照=当前累计）；
+# 覆盖重装/脚本更新时（KEEP_TRAFFIC=1）只刷新快照不归零，当月累计延续
+if [ "${KEEP_TRAFFIC:-0}" = "1" ] && [ -f /var/lib/traffic_monitor/netcount ]; then
+    "$SCRIPT_DIR/netstat.sh" >/dev/null 2>&1 || true
+    echo "--> 流量统计脚本已生成（当月累计保留，仅刷新快照）。"
+else
+    "$SCRIPT_DIR/netstat.sh" --reset >/dev/null 2>&1 || true
+    echo "--> 流量统计脚本已生成并初始化 (独立于 vnstat)。"
+fi
 
 # 3.5 生成运行时配置文件与密钥
 gen_key
@@ -1957,6 +2026,9 @@ main() {
             ;;
         restore | unblock)
             menu_restore
+            ;;
+        update | upgrade)
+            menu_update
             ;;
         del | un)
             uninstall
