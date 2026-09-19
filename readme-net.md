@@ -52,8 +52,8 @@ mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh 
 # 2. 纯封网版-没有tg通知（gcp 无默认上限，这里显式指定 180GB）
 PLATFORM=gcp LIMIT=180 bash traffic_ctrl.sh
 
-# 纯封网版，部署到 oracle，上限 500GB，SSH 端口 2222
-PLATFORM=oracle LIMIT=500 SSH_PORT=2222 bash traffic_ctrl.sh
+# 纯封网版，部署到 oracle，上限 500GB，SSH 端口 22（这个端口不要乱改，是内部22端口）
+PLATFORM=oracle LIMIT=500 SSH_PORT=22 bash traffic_ctrl.sh
 
 # 自定义平台示例：aws，手动指定上限 1024GB
 PLATFORM=aws LIMIT=1024 bash /root/traffic_ctrl.sh
