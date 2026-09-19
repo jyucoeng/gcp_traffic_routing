@@ -74,6 +74,9 @@ SCRIPT_DIR="${SCRIPT_DIR:-/root/traffic_routing}"
 # 运行时配置目录：conf/key 统一收拢于此，方便以后整体迁移；
 # 部署流程会提前 mkdir -p 创建，uninstall 会清理此目录下的本脚本文件
 CONF_DIR="${CONF_DIR:-/etc/traffic_routing}"
+# 快捷指令名：部署后在 /usr/local/bin 下创建同名 symlink，指向部署器实际路径；
+# 之后可用 tfc 代替 bash /path/to/traffic_ctrl.sh（如 tfc config / tfc check）
+TFC_NAME="${TFC_NAME:-tfc}"
 # 运行时配置文件路径（一般通过 CONF_DIR 派生；需共享配置时可单独重定向 CONF_FILE）
 CONF_FILE="${CONF_FILE:-$CONF_DIR/netMonitor.conf}"
 # TG 凭据加密密钥文件（0600，root-only；丢失后凭据不可恢复，需重新 set-tg）
@@ -132,6 +135,40 @@ require_root() {
     fi
 }
 
+# ---------------- 子命令：quick ----------------
+# 仅安装快捷指令：落盘部署器到 SCRIPT_DIR/traffic_ctrl.sh + 建 /usr/local/bin/tfc 链接；
+# 不碰 conf/cron/iptables，可重复执行（幂等覆盖）；$0 为 curl 进程替换时同样可用。
+quick_install() {
+    require_root
+    mkdir -p "$SCRIPT_DIR"
+    DEPLOYER_DST="$SCRIPT_DIR/traffic_ctrl.sh"
+    case "$0" in
+        /dev/fd/*|/proc/self/fd/*)
+            if cat "$0" > "$DEPLOYER_DST" 2>/dev/null && [ -s "$DEPLOYER_DST" ]; then
+                echo "--> 部署器已落盘：$DEPLOYER_DST（本次为 curl 进程替换安装）"
+            else
+                echo "错误：部署器落盘失败（$0 不可读）。" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            if [ -f "$0" ]; then
+                if [ "$0" != "$DEPLOYER_DST" ]; then
+                    cp -f "$0" "$DEPLOYER_DST" 2>/dev/null || cat "$0" > "$DEPLOYER_DST" 2>/dev/null || true
+                fi
+            else
+                echo "错误：找不到部署器文件（$0）。" >&2
+                exit 1
+            fi
+            ;;
+    esac
+    chmod +x "$DEPLOYER_DST"
+    mkdir -p /usr/local/bin 2>/dev/null || true
+    ln -sf "$DEPLOYER_DST" "/usr/local/bin/${TFC_NAME:-tfc}"
+    echo "--> 快捷指令已创建：${TFC_NAME:-tfc} -> $DEPLOYER_DST"
+    echo "    用法：${TFC_NAME:-tfc} config|check|restore|edit|menu"
+}
+
 # ==================================================
 # 卸载函数（del 子命令 / 覆盖式安装共用）
 # 只清理"本脚本自己的部署物"，不动宿主其他 crontab/iptables 规则；
@@ -145,9 +182,10 @@ uninstall() {
         crontab -l 2>/dev/null | grep -vE 'check_traffic\.sh|reset_network\.sh' | crontab - 2>/dev/null || true
     fi
 
-    # 2. 删除部署时生成的运行时脚本（SCRIPT_DIR；兼容清理旧版 /root 直放路径）
+    # 2. 删除部署时生成的运行时脚本（SCRIPT_DIR；兼容清理旧版 /root 直放路径）与快捷指令
     rm -f "$SCRIPT_DIR/check_traffic.sh" "$SCRIPT_DIR/reset_network.sh" "$SCRIPT_DIR/netstat.sh" 2>/dev/null || true
     rm -f /root/check_traffic.sh /root/reset_network.sh /root/netstat.sh 2>/dev/null || true
+    rm -f "/usr/local/bin/${TFC_NAME:-tfc}" 2>/dev/null || true
     rmdir "$SCRIPT_DIR" 2>/dev/null || true
 
     # 3. 删除运行时配置（保留 NETMON_KEY：覆盖式重装复用 TG 密钥；兼容删旧版硬编码路径）
@@ -355,6 +393,15 @@ config_edit() {
     t="$(dec_tg "$TELEGRAM_BOT_TOKEN_ENC")"
     c="$(dec_tg "$TELEGRAM_CHAT_ID_ENC")"
 
+    # 单项即改即保存：每改一项直接加密落盘，无需最后统一保存
+    save_edit() {
+        TELEGRAM_BOT_TOKEN="$t"
+        TELEGRAM_CHAT_ID="$c"
+        gen_key
+        write_conf
+        echo "-> 已保存（加密写入 ${CONF_FILE}），即时生效。"
+    }
+
     while :; do
         echo ""
         echo "========================="
@@ -375,7 +422,7 @@ config_edit() {
         echo " 3) 修改流量口径     4) 修改 SSH 端口"
         echo " 5) 修改 DNS 服务器  6) 修改 TG 凭据"
         echo " 7) 清空 TG 凭据     8) 修改日志保留天数"
-        echo " 9) 保存并退出       0) 不保存退出"
+        echo " 0) 返回上级菜单"
         echo "========================================"
         printf "请选择: "
         read -r opt || break
@@ -383,65 +430,59 @@ config_edit() {
         case "$opt" in
             1)
                 printf "新平台(建议小写，如 gcp/oracle/aws/custom) [${PLATFORM:-gcp}]: "; read -r v
-                [ -n "$v" ] && PLATFORM="$v"
+                if [ -n "$v" ]; then PLATFORM="$v"; save_edit; fi
                 ;;
             2)
                 printf "新上限 GB (0/-1=无限制，留空=不设置) [${LIMIT:-未设置}]: "; read -r v
                 case "$v" in
-                    "") LIMIT="" ;;
-                    -1) LIMIT="-1" ;;
-                    0)  LIMIT="0" ;;
-                    *[!0-9]*) echo "无效上限（仅允许非负整数，0/-1=无限制，留空=不设置）。" ;;
-                    *) LIMIT="$v" ;;
+                    "") LIMIT="" ; save_edit ;;
+                    -1) LIMIT="-1" ; save_edit ;;
+                    0)  LIMIT="0" ; save_edit ;;
+                    *[!0-9.]*) echo "无效上限（仅允许非负数，0/-1=无限制，留空=不设置）。" ;;
+                    *) LIMIT="$v" ; save_edit ;;
                 esac
                 ;;
             3)
-                printf "流量口径: out(出站) in(入站) max(取大) sum(总和) [${STAT_MODE:-sum}]: "; read -r v
+                printf "流量口径: out(出站) in(入站) max(取大) min(取小) sum(总和) [${STAT_MODE:-sum}]: "; read -r v
                 case "$v" in
-                    out|in|max|min|sum) STAT_MODE="$v" ;;
+                    out|in|max|min|sum) STAT_MODE="$v" ; save_edit ;;
                     "") : ;;
                     *) echo "无效口径，保留 ${STAT_MODE:-sum}。" ;;
                 esac
                 ;;
             4)
                 printf "新 SSH 端口 [${SSH_PORT:-22}]: "; read -r v
-                [ -n "$v" ] && SSH_PORT="$v"
+                if [ -n "$v" ]; then SSH_PORT="$v"; save_edit; fi
                 ;;
             5)
                 printf "新 DNS 服务器(空格分隔) [${DNS_SERVERS:-8.8.8.8 8.8.4.4}]: "; read -r v
-                [ -n "$v" ] && DNS_SERVERS="$v"
+                if [ -n "$v" ]; then DNS_SERVERS="$v"; save_edit; fi
                 ;;
             6)
                 printf "新 Bot Token (留空保持不变): "; read -rs t2; echo
                 printf "新 Chat ID (留空保持不变): "; read -rs c2; echo
                 [ -n "$t2" ] && t="$t2"
                 [ -n "$c2" ] && c="$c2"
+                save_edit
                 ;;
             7)
                 t=""
                 c=""
+                save_edit
                 echo "-> TG 凭据已清空"
                 ;;
             8)
                 printf "日志保留天数 (0/-1=保留全部) [${LOG_RETENTION_DAYS:-7}]: "; read -r v
                 case "$v" in
                     "") : ;;
-                    -1) LOG_RETENTION_DAYS="-1" ;;
-                    0)  LOG_RETENTION_DAYS="0" ;;
+                    -1) LOG_RETENTION_DAYS="-1" ; save_edit ;;
+                    0)  LOG_RETENTION_DAYS="0" ; save_edit ;;
                     *[!0-9]*) echo "无效天数（仅允许非负整数，0/-1=保留全部）。" ;;
-                    *) LOG_RETENTION_DAYS="$v" ;;
+                    *) LOG_RETENTION_DAYS="$v" ; save_edit ;;
                 esac
                 ;;
-            9)
-                TELEGRAM_BOT_TOKEN="$t"
-                TELEGRAM_CHAT_ID="$c"
-                gen_key
-                write_conf
-                echo "-> 配置已保存（加密写入 ${CONF_FILE}）。"
-                break
-                ;;
             0)
-                echo "-> 已取消，未做任何修改。"
+                echo "-> 返回上级菜单。"
                 break
                 ;;
             *)
@@ -453,6 +494,26 @@ config_edit() {
 
 # ---------------- 子命令：menu / 默认入口 ----------------
 # 不加参数或 menu 子命令进入管理菜单（部署/查看/修改/卸载/退出）
+# 查看流量：直接跑运行时 check 脚本（查当月上下行 + 超限判定 + 封网；未部署时提示）
+menu_check() {
+    if [ -x "$SCRIPT_DIR/check_traffic.sh" ]; then
+        bash "$SCRIPT_DIR/check_traffic.sh"
+    elif [ -x /root/traffic_routing/check_traffic.sh ]; then
+        bash /root/traffic_routing/check_traffic.sh
+    else
+        echo "未找到 check_traffic.sh，请先部署（菜单 1）。"
+    fi
+}
+# 恢复网络：直接跑运行时 reset 脚本（清封网 + 重置统计 + 归档；未部署时提示）
+menu_restore() {
+    if [ -x "$SCRIPT_DIR/reset_network.sh" ]; then
+        bash "$SCRIPT_DIR/reset_network.sh"
+    elif [ -x /root/traffic_routing/reset_network.sh ]; then
+        bash /root/traffic_routing/reset_network.sh
+    else
+        echo "未找到 reset_network.sh，请先部署（菜单 1）。"
+    fi
+}
 main_menu() {
     require_root
     while :; do
@@ -461,13 +522,16 @@ main_menu() {
         echo " 小鸡流量限制管理脚本"
         echo " Author：${AUTHOR}"
         echo " Version: ${VERSION}"
+        echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
         echo "========================="
         echo " 1) 安装 / 覆盖安装"
         echo " 2) 查看当前配置"
         echo " 3) 修改配置（交互菜单）"
         echo " 4) 设置/更换 TG 凭据"
         echo " 5) 停用 TG 通知（清除凭据）"
-        echo " 6) 卸载"
+        echo " 6) 查看流量"
+        echo " 7) 恢复网络"
+        echo " 8) 卸载"
         echo " 0) 退出"
         echo "========================="
         printf "请选择: "
@@ -496,7 +560,17 @@ main_menu() {
                 tg_clear
                 ;;
             6)
-                printf "确认卸载？部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
+                menu_check
+                ;;
+            7)
+                printf "确认恢复网络？将清除封网规则并重置当月统计 (y/N): "; read -r a
+                case "$a" in
+                    y|Y|yes|YES) menu_restore ;;
+                    *) echo "-> 已取消。" ;;
+                esac
+                ;;
+            8)
+                printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) uninstall ;;
                     *) echo "-> 已取消。" ;;
@@ -526,6 +600,8 @@ print_usage() {
   config           查看当前配置（TG 凭据掩码显示）
   set-tg           更换 TG 凭据：TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
   clear-tg         停用并清除 TG 凭据
+  check            查看流量（跑 check_traffic.sh：查当月上下行 + 超限判定）
+  restore          恢复网络（跑 reset_network.sh：清封网 + 重置统计）
   del              卸载
   -h | --help | help  显示本帮助
 
@@ -1787,9 +1863,10 @@ else
 fi
 EOF
 
-# 6. 赋予执行权限
+# 6. 赋予执行权限 + 落盘部署器 + 创建快捷指令（复用 quick_install，幂等）
 chmod +x "$SCRIPT_DIR/check_traffic.sh"
 chmod +x "$SCRIPT_DIR/reset_network.sh"
+quick_install || echo "--> 警告：快捷指令创建失败，不影响部署本身。" >&2
 
 # 7. 设置定时任务
 echo "--> 更新 Crontab 定时任务..."
@@ -1824,12 +1901,13 @@ echo "运行时脚本目录   : $SCRIPT_DIR (check/reset/netstat 统一收拢于
 echo "运行时配置文件   : $CONF_FILE (0600，请勿手改；改动请用子命令)"
 echo "TG 密钥文件      : $NETMON_KEY (0600，丢失后凭据不可恢复)"
 echo ""
-echo "后续配置修改/查看命令："
-echo "  bash $0 edit       # 交互式菜单：修改平台/上限/端口/DNS/网卡/TG"
-echo "  bash $0 config     # 查看当前配置 (TG 凭据掩码显示)"
+echo "后续配置修改/查看命令（快捷指令 ${TFC_NAME:-tfc} 与 bash $0 等价）："
+echo "  ${TFC_NAME:-tfc} edit       # 交互式菜单：修改平台/上限/端口/DNS/网卡/TG"
+echo "  ${TFC_NAME:-tfc} config     # 查看当前配置 (TG 凭据掩码显示)"
+echo "  ${TFC_NAME:-tfc} check      # 查看流量"
+echo "  ${TFC_NAME:-tfc} restore    # 恢复网络"
 echo "  bash $0 set-tg     # 换 TG: TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash $0 set-tg"
 echo "  bash $0 clear-tg   # 停用并清除 TG 凭据"
-echo "  bash $SCRIPT_DIR/check_traffic.sh   # 手动查看流量"
 echo "=========================================="
 echo "当前配置："
 echo "  平台       : $PLATFORM"
@@ -1871,6 +1949,12 @@ main() {
             ;;
         edit)
             config_edit
+            ;;
+        check | status-t)
+            menu_check
+            ;;
+        restore | unblock)
+            menu_restore
             ;;
         del | un)
             uninstall

@@ -29,6 +29,8 @@
 > **⚠️ TG 凭据不明文落盘**：`TELEGRAM_BOT_TOKEN_ENC` / `TELEGRAM_CHAT_ID_ENC` 为 AES-256 加密密文（密钥存 `/etc/traffic_routing/netMonitor.key`，权限 0600）。换凭据请用子命令 `set-tg`，不要手改密文。
 
 > **部署脚本建议下载到 VPS 本地保存**：封网后 VPS 断外网，但本地 `traffic_ctrl.sh` 仍可直接运行——可随时 `edit` 调配置、`set-tg` 换凭据、甚至**重新部署**（不依赖网络）。
+>
+> **快捷指令 `tfc`**：部署成功后自动把部署器落盘到 `SCRIPT_DIR/traffic_ctrl.sh`（默认 `/root/traffic_routing/traffic_ctrl.sh`），并在 `/usr/local/bin/tfc` 创建软链接指向它；之后 `tfc <子命令>` 与 `bash <落盘路径> <子命令>` 等价（如 `tfc config` / `tfc check` / `tfc restore` / `tfc edit`）。`bash <(curl …)` 进程替换部署时也会自动落盘，无需手动 `wget`；卸载时同步删除该链接。
 
 ---
 
@@ -250,11 +252,13 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | 子命令 | 作用 |
 |------|------|
 | `req` / `install` | 部署 / 覆盖安装（装完停住，按任意键进菜单） |
-| `menu`（或无参数） | 进入管理菜单（安装/查看/修改/TG/卸载/退出） |
+| `menu`（或无参数） | 进入管理菜单（安装/查看/修改/TG/流量/恢复/卸载/退出） |
 | `edit` | 交互式菜单修改平台/上限/口径/SSH端口/DNS/TG/日志保留天数（推荐） |
 | `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
 | `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
+| `check` | 查看流量（跑 `check_traffic.sh`：查当月上下行 + 超限判定 + 封网） |
+| `restore` | 恢复网络（跑 `reset_network.sh`：清封网 + 重置统计 + 归档） |
 | `del` / `un` | 卸载（清本脚本封网规则 + 删 crontab 调度/运行时脚本/conf/state/notify/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
 | `help` | 显示全部命令用法 |
 
