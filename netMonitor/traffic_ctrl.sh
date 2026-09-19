@@ -1092,7 +1092,15 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
 🌐 CPU: \$(get_cpu_type)"
             fi
 
-            # 已用流量(计费口径 BAL)及其显示单位; 上限若与已用流量单位不同, 追加换算值 (如 上限: 0.0001 GB (0.10 MB))
+            # 已用流量(计费口径 BAL)及其显示单位; 上限若与已用流量单位不同, 追加换算值 (如 上限: 0.0001 GB (0.10MB))
+            # 口径中文名: sum-总和 / out-出站 / in-入站 / max-取大 / min-取小
+            case "\$STAT_MODE" in
+                out) STAT_LABEL="out-出站" ;;
+                in)  STAT_LABEL="in-入站" ;;
+                max) STAT_LABEL="max-取大" ;;
+                min) STAT_LABEL="min-取小" ;;
+                *)   STAT_LABEL="sum-总和" ;;
+            esac
             USED_FMT="\$(format_traffic "\$BAL_BYTES")"
             USED_UNIT="\$(printf '%s' "\$USED_FMT" | grep -oE 'MB|GB|TB' | tail -n1)"
             LIMIT_DISPLAY="\$LIMIT GB"
@@ -1102,18 +1110,19 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
                     TB) LIMIT_DIV=1099511627776 ;;
                     *)  LIMIT_DIV=1073741824 ;;
                 esac
-                LIMIT_CONV="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES / \$LIMIT_DIV" | bc)")\$USED_UNIT"
+                LIMIT_CONV="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES / \$LIMIT_DIV" | bc)") \$USED_UNIT"
                 LIMIT_DISPLAY="\$LIMIT GB (\$LIMIT_CONV)"
             fi
 
             # 组装通知文本 (oracle 时含 CPU 行); 运行时间在组装消息时(发送前最后一刻)才取, 尽量接近实际发送时刻
+            # 版式: 口径中文名 + 上限(括号内自动换算同单位)一行; 已用流量 + 上行/下行一行
 TG_MSG="🎮 \$PLATFORM 流量报告（流量超限通知）
 
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$(TZ='UTC-8' date '+%Y-%m-%d %H:%M:%S')
 📚 网络状态: 正常 ---> 超限(双向封网)
-📊 计费口径: \$STAT_MODE / 上限: \$LIMIT_DISPLAY
-📊 已用流量: \$USED_FMT (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${CPU_LINE}"
+📊 计费口径: \$STAT_LABEL / 上限: \$LIMIT_DISPLAY
+🌐 已用流量: \$USED_FMT / (上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX"))\${CPU_LINE}"
 
             tg_send "\$TG_MSG"
             log "已发送流量超限 TG 通知。"
@@ -1519,6 +1528,15 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
     fi
 
     # 本月流量/上限 恒显示 (重置已清零, 本月为 0); 有上月(重置前)记录时附加展示
+    # 上限换算: 本月流量恒为 0.00MB, 故上限统一换算成 MB 括号展示 (如 上限: 10 GB (10240.00MB))
+    LIMIT_MB_DISPLAY="\$LIMIT GB"
+    if [ -n "\$LIMIT" ] && [ "\$LIMIT" != "0" ] && [ "\$LIMIT" != "-1" ]; then
+        LIMIT_BYTES_RST=\$(echo "scale=0; \$LIMIT * 1073741824 / 1" | bc 2>/dev/null)
+        case "\$LIMIT_BYTES_RST" in ''|*[!0-9]*) : ;; *)
+            LIMIT_MB_CONV="\$(fmt_fix "\$(echo "scale=2; \$LIMIT_BYTES_RST / 1048576" | bc)")MB"
+            LIMIT_MB_DISPLAY="\$LIMIT GB (\$LIMIT_MB_CONV)" ;;
+        esac
+    fi
     LAST_MONTH_LINE=""
     if [ "\$LAST_MONTH_OK" = "1" ]; then
         LAST_MONTH_LINE="
@@ -1530,7 +1548,7 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
 🌐 本机IP: \$MASKED_IP (\$LOC)
 🕐 运行时间: \$RUN_TIME
 📚 网络状态: 超限封网 ---> 已恢复
-🌐 本月流量: 上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX") / 上限: \$LIMIT GB\${LAST_MONTH_LINE}\${CPU_LINE}"
+🌐 本月流量: 上行 \$(format_traffic "\$MONTH_TX") / 下行 \$(format_traffic "\$MONTH_RX") / 上限: \$LIMIT_MB_DISPLAY\${LAST_MONTH_LINE}\${CPU_LINE}"
 
     tg_send "\$TG_MSG"
     log "已发送网络恢复 TG 通知。"
