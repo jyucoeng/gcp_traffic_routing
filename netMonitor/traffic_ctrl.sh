@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.3}"
+VERSION="${VERSION:-v1.0.4}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -561,6 +561,18 @@ menu_install_ask() {
     fi
     printf "平台 PLATFORM [%s]: " "$_d_platform"; read -r v || return 1
     [ -n "$v" ] && PLATFORM="$v" || PLATFORM="$_d_platform"
+    echo -e "  │→ 平台: \033[32m$PLATFORM\033[0m"
+    echo "流量口径 STAT_MODE 可选项："
+    echo "  in=入站  out=出站  max=取大  min=取小  sum=总和"
+    while :; do
+        printf "流量口径 [默认 %s]: " "$_d_stat"; read -r v || return 1
+        case "$v" in
+            "") STAT_MODE="$_d_stat"; break ;;
+            in|out|max|min|sum) STAT_MODE="$v"; break ;;
+            *) echo "无效口径，请从 in/out/max/min/sum 中选择。" ;;
+        esac
+    done
+    echo -e "  │→ 流量口径: \033[32m$STAT_MODE\033[0m"
     while :; do
         if [ -n "$_d_limit" ]; then
             printf "流量上限 LIMIT(GB) [%s]: " "$_d_limit"; read -r v || return 1
@@ -576,25 +588,18 @@ menu_install_ask() {
             *) LIMIT="$v"; break ;;
         esac
     done
-    echo "流量口径 STAT_MODE 可选项："
-    echo "  in=入站  out=出站  max=取大  min=取小  sum=总和"
-    while :; do
-        printf "流量口径 [默认 %s]: " "$_d_stat"; read -r v || return 1
-        case "$v" in
-            "") STAT_MODE="$_d_stat"; break ;;
-            in|out|max|min|sum) STAT_MODE="$v"; break ;;
-            *) echo "无效口径，请从 in/out/max/min/sum 中选择。" ;;
-        esac
-    done
-    printf "SSH 端口 [%s]: " "$_d_ssh"; read -r v || return 1
+    echo -e "  │→ 流量上限: \033[32m${LIMIT}GB\033[0m"
+    printf "SSH 端口 [默认 %s，一般不用改]: " "$_d_ssh"; read -r v || return 1
     [ -n "$v" ] && SSH_PORT="$v" || SSH_PORT="$_d_ssh"
+    echo -e "  │→ SSH 端口: \033[32m$SSH_PORT\033[0m"
     printf "DNS 服务器(空格分隔, 留空自动) [%s]: " "${_d_dns:-自动}"; read -r v || return 1
     [ -n "$v" ] && DNS_SERVERS="$v" || DNS_SERVERS="$_d_dns"
+    echo -e "  │→ DNS 服务器: \033[32m${DNS_SERVERS:-自动}\033[0m"
     if [ "$_has_tg" = "1" ]; then
         printf "TG 凭据 [已启用，回车保留，输入 clear 清除]: "; read -r v || return 1
         case "$v" in
-            clear|CLEAR) TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID="" ;;
-            "") : ;;
+            clear|CLEAR) TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""; echo -e "  │→ TG 通知: \033[32m已清除（不启用）\033[0m" ;;
+            "") echo -e "  │→ TG 通知: \033[32m保留已启用\033[0m" ;;
             *) echo "提示：更换 TG 请用 4) 修改配置 或 set-tg，此处仅保留/清除。" ;;
         esac
     else
@@ -602,9 +607,12 @@ menu_install_ask() {
         printf "TG Chat ID (留空不启用): "; read -rs _nc; echo
         if [ -n "$_nt" ] && [ -n "$_nc" ]; then
             TELEGRAM_BOT_TOKEN="$_nt"; TELEGRAM_CHAT_ID="$_nc"
+            echo -e "  │→ TG 通知: \033[32m已启用\033[0m"
         elif [ -n "$_nt" ] || [ -n "$_nc" ]; then
             echo "TG 凭据不完整（需同时填写），本次不启用。"
             TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""
+        else
+            echo -e "  │→ TG 通知: \033[32m不启用\033[0m"
         fi
     fi
     printf "日志保留天数 [%s]: " "$_d_log"; read -r v || return 1
@@ -614,6 +622,11 @@ menu_install_ask() {
         *[!0-9]*) echo "无效天数，用默认值 $_d_log。" ; LOG_RETENTION_DAYS="$_d_log" ;;
         *) LOG_RETENTION_DAYS="$v" ;;
     esac
+    if [ "$LOG_RETENTION_DAYS" = "0" ] || [ "$LOG_RETENTION_DAYS" = "-1" ]; then
+        echo -e "  │→ 日志保留: \033[32m保留全部\033[0m"
+    else
+        echo -e "  │→ 日志保留: \033[32m${LOG_RETENTION_DAYS} 天\033[0m"
+    fi
     echo ""
     echo "确认安装参数：平台=$PLATFORM 上限=${LIMIT}GB 口径=$STAT_MODE SSH=$SSH_PORT 日志保留=$LOG_RETENTION_DAYS 天"
     printf "开始安装？(y/N): "; read -r a || return 1
