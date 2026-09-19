@@ -255,7 +255,7 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
 | `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
-| `del` / `un` | 卸载（删 crontab 调度/运行时脚本/conf/state/notify/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
+| `del` / `un` | 卸载（清本脚本封网规则 + 删 crontab 调度/运行时脚本/conf/state/notify/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
 | `help` | 显示全部命令用法 |
 
 ---

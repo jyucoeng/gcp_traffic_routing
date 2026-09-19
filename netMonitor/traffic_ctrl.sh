@@ -155,7 +155,19 @@ uninstall() {
     rm -f /etc/netMonitor.conf 2>/dev/null || true
     [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
 
-    # 4. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
+    # 4. 清理本脚本的封网规则（只删自家 TRAFFIC_BLOCKED 链及跳转，不动其他程序规则/默认策略）
+    for _FW in iptables ip6tables; do
+        command -v "$_FW" >/dev/null 2>&1 || continue
+        for _CHAIN in INPUT OUTPUT FORWARD; do
+            "$_FW" -D "$_CHAIN" -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null || true
+            "$_FW" -D "$_CHAIN" -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null || true
+            "$_FW" -D "$_CHAIN" -j TRAFFIC_BLOCKED 2>/dev/null || true
+        done
+        "$_FW" -F TRAFFIC_BLOCKED 2>/dev/null || true
+        "$_FW" -X TRAFFIC_BLOCKED 2>/dev/null || true
+    done
+
+    # 5. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
     # 卸载清除本月状态(state)与 TG 发送历史(notify)；本月流量计数(netcount)保留 --
     # 覆盖式重装后继续累计当月实时流量；notify 清空后同月重装会重新发送通知（视为全新部署）
     rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/notify 2>/dev/null || true
