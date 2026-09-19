@@ -561,6 +561,43 @@ menu_update() {
     fi
     [ -s "$_tmp" ] || { echo "错误：下载文件为空。" >&2; rm -f "$_tmp"; return 1; }
     bash -n "$_tmp" 2>/dev/null || { echo "错误：新脚本语法校验未通过，已丢弃。" >&2; rm -f "$_tmp"; return 1; }
+    # 更新判定：SHA 为主（任何内容变化都检出），版本号为辅（展示用）；
+    # 本地对照文件优先用落盘副本（SCRIPT_DIR/traffic_ctrl.sh），回退 $0
+    _local_f="$SCRIPT_DIR/traffic_ctrl.sh"
+    case "$0" in
+        /dev/fd/*|/proc/self/fd/*) : ;;
+        *) [ -f "$_local_f" ] || { [ -f "$0" ] && _local_f="$0"; } ;;
+    esac
+    _local_v="${VERSION:-unknown}"
+    _remote_v="$(grep -m1 -oE 'VERSION:-v[0-9.]+' "$_tmp" 2>/dev/null | grep -oE 'v[0-9.]+' | head -n1)"
+    [ -n "$_remote_v" ] || _remote_v="unknown"
+    if [ -f "$_local_f" ] && { command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; }; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            _local_sha="$(sha256sum "$_local_f" 2>/dev/null | awk '{print $1}')"
+            _remote_sha="$(sha256sum "$_tmp" 2>/dev/null | awk '{print $1}')"
+        else
+            _local_sha="$(shasum -a 256 "$_local_f" 2>/dev/null | awk '{print $1}')"
+            _remote_sha="$(shasum -a 256 "$_tmp" 2>/dev/null | awk '{print $1}')"
+        fi
+        if [ -n "$_local_sha" ] && [ "$_local_sha" = "$_remote_sha" ]; then
+            echo "--> 已是最新（SHA 一致，$_local_v），无需更新。"
+            rm -f "$_tmp"
+            return 0
+        fi
+        if [ "$_local_v" = "$_remote_v" ]; then
+            echo "--> 发现内容更新（同版本 hotfix，$_local_v，SHA 不一致），正在更新..."
+        else
+            echo "--> 发现新版本：$_local_v -> $_remote_v，正在更新..."
+        fi
+    else
+        # 无 sha256sum 时回退纯版本号比较
+        if [ "$_local_v" = "$_remote_v" ]; then
+            echo "--> 已是最新版本（$_local_v），无需更新。"
+            rm -f "$_tmp"
+            return 0
+        fi
+        echo "--> 发现新版本：$_local_v -> $_remote_v，正在更新..."
+    fi
     case "$0" in
         /dev/fd/*|/proc/self/fd/*) : ;;
         *) [ -f "$0" ] && cp -f "$_tmp" "$0" ;;
