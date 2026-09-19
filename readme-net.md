@@ -256,7 +256,7 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
 | `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
-| `del` / `un` | 卸载（删 crontab 调度/运行时脚本/conf/state/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
+| `del` / `un` | 卸载（删 crontab 调度/运行时脚本/conf/state/notify/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
 | `help` | 显示全部命令用法 |
 
 ---
@@ -390,7 +390,7 @@ iptables -X TRAFFIC_BLOCKED
 | `/var/log/traffic_monitor.log` | 监控日志（每月 1 号按 `LOG_RETENTION_DAYS` 保留最近 N 天，默认 7 天） |
 | `/var/log/network_reset.log` | 重置日志 |
 | `/var/lib/traffic_monitor/state` | 运行状态（当前月/封网状态/断网恢复时刻/当月流量快照 USED_*；卸载时删除） |
-| `/var/lib/traffic_monitor/notify` | TG 发送历史（一行一月 UTC 时间戳，`OVER` 超限 / `RESTORE` 恢复；每月各最多 1 条的判定依据；只留最近 12 个月；卸载保留） |
+| `/var/lib/traffic_monitor/notify` | TG 发送历史（一行一月 UTC 时间戳，`OVER` 超限 / `RESTORE` 恢复；每月各最多 1 条的判定依据；只留最近 12 个月；**卸载时清空**，覆盖重装保留） |
 | `/var/lib/traffic_monitor/netcount` | 流量月度累计（MONTH + 当月上行/下行字节，由 netstat.sh 持久化；**卸载与覆盖安装均保留**） |
 | `/var/lib/traffic_monitor/archive` | 月度流量档案（每月重置前把上月最终 TX/RX 追加一行，长期留存；含 `mode=` 上月口径与 `blocked=` 封网状态；卸载保留） |
 | `/var/lib/traffic_monitor/grand_total` | 总计流量（从部署到现在的上下行总计，长期累计，卸载不清） |

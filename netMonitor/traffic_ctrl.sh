@@ -156,9 +156,9 @@ uninstall() {
     [ -n "${CONF_DIR:-}" ] && rmdir "$CONF_DIR" 2>/dev/null || true
 
     # 4. 删除运行时状态/计数/日志（保留 archive 月度档案：长期留存上月流量结存）
-    # 卸载只清除本月状态(state)；本月流量计数(netcount)与 TG 月度发送标记(notify)保留 --
-    # 覆盖式重装后继续累计当月实时流量，且同月不重复发送超限/恢复通知
-    rm -f /var/lib/traffic_monitor/state 2>/dev/null || true
+    # 卸载清除本月状态(state)与 TG 发送历史(notify)；本月流量计数(netcount)保留 --
+    # 覆盖式重装后继续累计当月实时流量；notify 清空后同月重装会重新发送通知（视为全新部署）
+    rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/notify 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
     rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
 
