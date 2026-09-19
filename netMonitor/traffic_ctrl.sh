@@ -135,9 +135,10 @@ require_root() {
     fi
 }
 
-# ---------------- 子命令：quick ----------------
-# 仅安装快捷指令：落盘部署器到 SCRIPT_DIR/traffic_ctrl.sh + 建 /usr/local/bin/tfc 链接；
-# 不碰 conf/cron/iptables，可重复执行（幂等覆盖）；$0 为 curl 进程替换时同样可用。
+# ---------------- 内部函数：quick_install ----------------
+# 落盘部署器到 SCRIPT_DIR/traffic_ctrl.sh + 建 /usr/local/bin/tfc 链接；幂等可重入。
+# 失败时 return 1（由调用方降级为警告，绝不 exit 中断部署本身）；
+# $0 为 curl 进程替换时 fd 可能已被读空，此时提示手动 wget 落盘。
 quick_install() {
     require_root
     mkdir -p "$SCRIPT_DIR"
@@ -147,8 +148,9 @@ quick_install() {
             if cat "$0" > "$DEPLOYER_DST" 2>/dev/null && [ -s "$DEPLOYER_DST" ]; then
                 echo "--> 部署器已落盘：$DEPLOYER_DST（本次为 curl 进程替换安装）"
             else
-                echo "错误：部署器落盘失败（$0 不可读）。" >&2
-                exit 1
+                echo "--> 提示：进程替换 fd 已耗尽，无法自动落盘部署器。" >&2
+                echo "    请手动执行：wget -O $DEPLOYER_DST https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh" >&2
+                return 1
             fi
             ;;
         *)
@@ -157,8 +159,8 @@ quick_install() {
                     cp -f "$0" "$DEPLOYER_DST" 2>/dev/null || cat "$0" > "$DEPLOYER_DST" 2>/dev/null || true
                 fi
             else
-                echo "错误：找不到部署器文件（$0）。" >&2
-                exit 1
+                echo "--> 提示：找不到部署器文件（$0），跳过快捷指令创建。" >&2
+                return 1
             fi
             ;;
     esac
