@@ -1682,7 +1682,7 @@ main() {
         req | install)
             do_install
             # 覆盖安装后停住，按任意键进入管理菜单 (非交互 stdin 下 read 直接 EOF 进菜单后退出，不阻塞自动化)
-            printf "安装已结束，按任意键进入菜单..."
+            printf "\033[32m安装已结束，按任意键进入菜单...\033[0m"
             read -r -n1 _k < /dev/tty 2>/dev/null || read -r _k 2>/dev/null || true
             echo ""
             main_menu
