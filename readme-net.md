@@ -59,6 +59,12 @@ PLATFORM=aws LIMIT=1024 bash /root/traffic_ctrl.sh
 
 # TG 通知版，部署到 oracle（启用断网/恢复的tg通知）
 PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh
+
+# TG 通知版，部署到 oracle首尔（平台名可含中文，含 oracle 即触发 oracle 逻辑，TG 标题显示对应平台名；小 LIMIT 用于测试断网/TG）
+PLATFORM='oracle首尔' LIMIT=0.0002 \
+TELEGRAM_BOT_TOKEN=xxx \
+TELEGRAM_CHAT_ID=yyy \
+bash /root/traffic_ctrl.sh req
 ```
 
 > 若 GitHub 无法访问，也可先用 `curl -O https://raw.githubusercontent.com/...` 下载。
@@ -124,17 +130,14 @@ ufw / firewalld 默认开启（会接管/覆盖 iptables 规则）
 ### 2. 下载并执行部署
 ```bash
 # 下载部署脚本到本地（建议永久保存，封网后可离线运行）
-wget -O /root/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh
-chmod +x /root/traffic_ctrl.sh
+mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chmod +x /root/traffic_routing/traffic_ctrl.sh && cd /root/traffic_routing
 
-# 基础版，目标为 gcp（显式指定上限 180GB）
-PLATFORM=gcp LIMIT=180 bash /root/traffic_ctrl.sh
-
-# 基础版，目标为 Oracle，上限 500GB
-PLATFORM=oracle LIMIT=500 bash /root/traffic_ctrl.sh
-
-# TG 通知版，目标为 Oracle（环境变量传入平台、上限与 TG 凭据）
-PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh
+# TG 通知版，
+PLATFORM='oracle首尔' \
+LIMIT=0.0002 \
+TELEGRAM_BOT_TOKEN=xxx \
+TELEGRAM_CHAT_ID=yyy \
+bash traffic_ctrl.sh req
 ```
 
 部署过程会：
