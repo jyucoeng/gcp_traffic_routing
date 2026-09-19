@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.10}"
+VERSION="${VERSION:-v1.0.11}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -510,8 +510,10 @@ config_edit() {
                 if [ -n "$v" ]; then DNS_SERVERS="$v"; save_edit; fi
                 ;;
             6)
-                printf "新 Bot Token (留空保持不变): "; read -rs t2; echo
-                printf "新 Chat ID (留空保持不变): "; read -rs c2; echo
+                printf "新 Bot Token (留空保持不变): "; read -r t2
+                echo -e "  │→ Bot Token: \033[32m${t2:-保持不变}\033[0m"
+                printf "新 Chat ID (留空保持不变): "; read -r c2
+                echo -e "  │→ Chat ID: \033[32m${c2:-保持不变}\033[0m"
                 [ -n "$t2" ] && t="$t2"
                 [ -n "$c2" ] && c="$c2"
                 save_edit
