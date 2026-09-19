@@ -62,7 +62,7 @@ PLATFORM=aws LIMIT=1024 bash /root/traffic_ctrl.sh
 PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash traffic_ctrl.sh
 
 # TG 通知版，部署到 oracle首尔（平台名可含中文，含 oracle 即触发 oracle 逻辑，TG 标题显示对应平台名；小 LIMIT 用于测试断网/TG）
-PLATFORM='oracle首尔' LIMIT=0.0002 \
+PLATFORM='oracle首尔' LIMIT=0.0002 STAT_MODE=sum \
 TELEGRAM_BOT_TOKEN=xxx \
 TELEGRAM_CHAT_ID=yyy \
 bash traffic_ctrl.sh req
@@ -133,9 +133,9 @@ ufw / firewalld 默认开启（会接管/覆盖 iptables 规则）
 # 下载部署脚本到本地（建议永久保存，封网后可离线运行）
 mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chmod +x /root/traffic_routing/traffic_ctrl.sh && cd /root/traffic_routing
 
-# TG 通知版，
+# TG 通知版（STAT_MODE 显式指定计费口径：in 入站 / out 出站 / max 取大 / min 取小 / sum 总和）
 PLATFORM='oracle首尔' \
-LIMIT=0.0002 \
+LIMIT=0.0002 STAT_MODE=sum \
 TELEGRAM_BOT_TOKEN=xxx \
 TELEGRAM_CHAT_ID=yyy \
 bash traffic_ctrl.sh req
