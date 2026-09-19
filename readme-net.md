@@ -325,7 +325,7 @@ TG 发送历史记录在 `/var/lib/traffic_monitor/notify`（一行一月，UTC 
 ```
 - `USED_*` 为**当月流量快照**：每次 check 判定后落盘；每月 reset 清零本月累计后随之归零（上月的最终值归档到 `/var/lib/traffic_monitor/archive`，一行一月）。
 - `notify` 与 `state` 分离存放：删 `state` / 覆盖重装 / 流量回落后同月再超限，都**不重发**（判定只看 `notify`，封网本身每次照常执行）。测试时想重发，手动删文件：`rm -f /var/lib/traffic_monitor/notify`。
-- `notify` 只保留最近 12 个月（每次发送时自动裁剪）；`RESTORE=-` 表示当月恢复通知尚未发送。
+- `notify` 只保留最近 12 个月（每次发送时自动裁剪）；`RESTORE=-` 表示当月恢复通知尚未发送（次月 1 号 reset 发送后才写入）。
 - 每月 reset 恢复后，若上月确实断过网且 TG 启用，才发恢复通知，并进入新月份周期。
 
 ---
