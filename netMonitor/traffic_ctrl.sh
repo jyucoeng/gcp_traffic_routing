@@ -628,7 +628,9 @@ menu_install_ask() {
         echo -e "  │→ 日志保留: \033[32m${LOG_RETENTION_DAYS} 天\033[0m"
     fi
     echo ""
-    echo "确认安装参数：平台=$PLATFORM 上限=${LIMIT}GB 口径=$STAT_MODE SSH=$SSH_PORT 日志保留=$LOG_RETENTION_DAYS 天"
+    _tg_show="未启用"
+    [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] && _tg_show="已启用"
+    echo "确认安装参数：平台=$PLATFORM 上限=${LIMIT}GB 口径=$STAT_MODE SSH=$SSH_PORT DNS=${DNS_SERVERS:-自动} TG=$_tg_show 日志保留=$LOG_RETENTION_DAYS 天"
     printf "开始安装？(y/N): "; read -r a || return 1
     case "$a" in y|Y|yes|YES) return 0 ;; *) echo "-> 已取消。" ; return 1 ;; esac
 }
