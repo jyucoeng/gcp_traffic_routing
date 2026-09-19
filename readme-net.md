@@ -169,7 +169,6 @@ bash traffic_ctrl.sh req
 
 因此统计**只关心网卡层上下行总量，不区分进程/IP**（与 nezha 一致），且不依赖 vnstat/任何守护进程。
 
-> 为什么换掉 vnstat：vnstat 依赖独立守护进程 + SQLite 数据库，数据库重建/服务重启时会出现采样停滞、"No data"、计数错乱等问题；nezha 式直读 `/proc/net/dev` 逻辑更简单、故障面更小，且与主流监控工具口径一致。
 
 ### 4. 封网策略（全局封锁，仅影响本脚本，不干扰其他程序）
 超限后，本脚本**只操作自己创建的 `TRAFFIC_BLOCKED` 链**，不改全局默认策略、不全局清空，**不影响其他程序已有的防火墙规则**。封网范围覆盖 **INPUT / OUTPUT / FORWARD 三条链**，实现真正全局封锁（**含转发至其他 VPS 的中转流量**，同样被 FORWARD 拦截）。**根据探测到的地址族**，IPv4 用 `iptables`、IPv6 用 `ip6tables`（含 `ip6tables` 专用的 `ipv6-icmp` 放行、IPv6 DNS 分流），双栈机两者同时生效。
