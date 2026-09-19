@@ -145,13 +145,11 @@ quick_install() {
     DEPLOYER_DST="$SCRIPT_DIR/traffic_ctrl.sh"
     case "$0" in
         /dev/fd/*|/proc/self/fd/*)
-            if cat "$0" > "$DEPLOYER_DST" 2>/dev/null && [ -s "$DEPLOYER_DST" ]; then
-                echo "--> 部署器已落盘：$DEPLOYER_DST（本次为 curl 进程替换安装）"
-            else
-                echo "--> 提示：进程替换 fd 已耗尽，无法自动落盘部署器。" >&2
-                echo "    请手动执行：wget -O $DEPLOYER_DST https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh" >&2
-                return 1
-            fi
+            # 进程替换的 fd 在部署过程中已被读空，此处不再尝试落盘（避免产生空文件坏链接）；
+            # 用户手动 wget 落盘后，tfc 即等价于 bash 落盘路径
+            echo "--> 提示：本次为 curl 进程替换安装，未自动创建快捷指令。" >&2
+            echo "    请手动执行：wget -O $DEPLOYER_DST https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chmod +x $DEPLOYER_DST && ln -sf $DEPLOYER_DST /usr/local/bin/${TFC_NAME:-tfc}" >&2
+            return 1
             ;;
         *)
             if [ -f "$0" ]; then
@@ -164,6 +162,8 @@ quick_install() {
             fi
             ;;
     esac
+    # 落盘文件非空校验：空文件不建链接（防坏链接误导）
+    [ -s "$DEPLOYER_DST" ] || { echo "--> 提示：落盘文件为空，跳过快捷指令创建。" >&2; return 1; }
     chmod +x "$DEPLOYER_DST"
     mkdir -p /usr/local/bin 2>/dev/null || true
     ln -sf "$DEPLOYER_DST" "/usr/local/bin/${TFC_NAME:-tfc}"
