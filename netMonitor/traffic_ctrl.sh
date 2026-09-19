@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v0.1.0}"
+VERSION="${VERSION:-v0.1.2}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -618,8 +618,8 @@ main_menu() {
         echo " 小鸡流量限制管理脚本"
         echo " Author：${AUTHOR}"
         echo " Version: ${VERSION}"
-        echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
         echo " 网络状态：$(menu_net_status)"
+        echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
         echo "========================="
         echo " 1) 安装 / 覆盖安装"
         echo " 2) 查看当前配置"
