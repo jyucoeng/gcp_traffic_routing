@@ -337,6 +337,29 @@ tg_clear() {
     echo "TG 凭据已清除（关闭通知）。"
 }
 
+# ---------------- 子命令：reset-notify ----------------
+# 重置本月 TG 发送计数：删掉 notify 历史中本月的行（OVER/RESTORE 重置为可发送）；
+# 历史月份保留；删整个文件=清空全部历史。本月超限/恢复通知可重新各发 1 条。
+tg_notify_reset() {
+    require_root
+    _nf="${NOTIFY_FILE:-/var/lib/traffic_monitor/notify}"
+    _m="$(date '+%Y-%m')"
+    if [ ! -f "$_nf" ]; then
+        echo "本月（$_m）无 TG 发送记录，无需重置。"
+        return 0
+    fi
+    _before="$(grep -cE "^${_m}[[:space:]]|^OVER_MONTH=${_m}$|^RESTORE_MONTH=${_m}$" "$_nf" 2>/dev/null)"
+    _tmp="${_nf}.tmp"
+    grep -Ev "^${_m}[[:space:]]" "$_nf" 2>/dev/null | grep -Ev "^OVER_MONTH=${_m}$" | grep -Ev "^RESTORE_MONTH=${_m}$" > "$_tmp" 2>/dev/null || : > "$_tmp"
+    cat "$_tmp" > "$_nf"
+    rm -f "$_tmp"
+    if [ "${_before:-0}" -gt 0 ] 2>/dev/null; then
+        echo "已重置本月（$_m）TG 发送计数，超限/恢复通知可重新各发 1 条。"
+    else
+        echo "本月（$_m）无 TG 发送记录，无需重置。"
+    fi
+}
+
 # ---------------- 子命令：config ----------------
 # 查看当前运行时配置；TG 凭据解密后以掩码显示（保留前4后4，隐藏中间）。
 config_show() {
@@ -604,7 +627,8 @@ main_menu() {
         echo " 4) 查看流量"
         echo " 5) 恢复网络"
         echo " 6) 脚本更新"
-        echo " 7) 卸载"
+        echo " 7) 重置本月 TG 发送计数"
+        echo " 8) 卸载"
         echo " 0) 退出"
         echo "========================="
         printf "请选择: "
@@ -634,6 +658,13 @@ main_menu() {
                 menu_update
                 ;;
             7)
+                printf "确认重置本月 TG 发送计数？超限/恢复通知可重新各发 1 条 (y/N): "; read -r a
+                case "$a" in
+                    y|Y|yes|YES) tg_notify_reset ;;
+                    *) echo "-> 已取消。" ;;
+                esac
+                ;;
+            8)
                 printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) uninstall ;;
