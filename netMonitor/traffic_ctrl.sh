@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.11}"
+VERSION="${VERSION:-v1.0.12}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -473,6 +473,7 @@ config_edit() {
         echo " 3) 修改流量口径     4) 修改 SSH 端口"
         echo " 5) 修改 DNS 服务器  6) 修改 TG 凭据"
         echo " 7) 清空 TG 凭据     8) 修改日志保留天数"
+        echo " 9) 重置 DNS 为自动"
         echo " 0) 返回上级菜单"
         echo "========================================"
         printf "请选择: "
@@ -507,7 +508,16 @@ config_edit() {
                 ;;
             5)
                 printf "新 DNS 服务器(空格分隔) [${DNS_SERVERS:-8.8.8.8 8.8.4.4}]: "; read -r v
-                if [ -n "$v" ]; then DNS_SERVERS="$v"; save_edit; fi
+                if [ -n "$v" ]; then
+                    _dns_ok=1
+                    for _d in $v; do
+                        case "$_d" in
+                            *.*|*:*) : ;;
+                            *) _dns_ok=0; break ;;
+                        esac
+                    done
+                    if [ "$_dns_ok" = "1" ]; then DNS_SERVERS="$v"; save_edit; else echo "无效 DNS（每项须含 . 或 :，如 8.8.8.8），未保存。"; fi
+                fi
                 ;;
             6)
                 printf "新 Bot Token (留空保持不变): "; read -r t2
@@ -533,6 +543,18 @@ config_edit() {
                     *[!0-9]*) echo "无效天数（仅允许非负整数，0/-1=保留全部）。" ;;
                     *) LOG_RETENTION_DAYS="$v" ; save_edit ;;
                 esac
+                ;;
+            9)
+                # 重置 DNS 为自动：清空后按地址族重算（HAS_V4/HAS_V6 部署期探测值；
+                # 双栈/纯v4 用 8.8.8.8，纯v6 用 Google IPv6 DNS），即时生效
+                DNS_SERVERS=""
+                if [ "${HAS_V4:-1}" = "0" ] && [ "${HAS_V6:-1}" = "1" ]; then
+                    DNS_SERVERS="2001:4860:4860::8888 2001:4860:4860::8844"
+                else
+                    DNS_SERVERS="8.8.8.8 8.8.4.4"
+                fi
+                save_edit
+                echo -e "  │→ DNS 已重置为自动: \033[32m$DNS_SERVERS\033[0m"
                 ;;
             0)
                 echo "-> 返回上级菜单。"
