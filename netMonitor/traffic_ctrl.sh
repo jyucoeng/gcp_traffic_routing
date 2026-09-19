@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.4}"
+VERSION="${VERSION:-v1.0.5}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -713,6 +713,8 @@ menu_update() {
     mkdir -p /usr/local/bin 2>/dev/null || true
     ln -sf "$SCRIPT_DIR/traffic_ctrl.sh" "/usr/local/bin/${TFC_NAME:-tfc}"
     rm -f "$_tmp"
+    # 更新内存中的版本号，让本次菜单头即时显示新版本（本次进程是旧脚本，需手动同步）
+    [ -n "$_remote_v" ] && [ "$_remote_v" != "unknown" ] && VERSION="$_remote_v"
     echo "--> 脚本已更新（部署器 + ${TFC_NAME:-tfc} 链接），正在用原配置重装以重生成运行时..."
     # 用原 conf 重装：读出原配置逐项透传（含 LIMIT/TG 明文解密），conf 缺失则提示手动安装
     if [ -f "$CONF_FILE" ]; then
