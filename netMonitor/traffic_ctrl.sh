@@ -713,8 +713,6 @@ menu_update() {
     mkdir -p /usr/local/bin 2>/dev/null || true
     ln -sf "$SCRIPT_DIR/traffic_ctrl.sh" "/usr/local/bin/${TFC_NAME:-tfc}"
     rm -f "$_tmp"
-    # 更新内存中的版本号，让本次菜单头即时显示新版本（本次进程是旧脚本，需手动同步）
-    [ -n "$_remote_v" ] && [ "$_remote_v" != "unknown" ] && VERSION="$_remote_v"
     echo "--> 脚本已更新（部署器 + ${TFC_NAME:-tfc} 链接），正在用原配置重装以重生成运行时..."
     # 用原 conf 重装：读出原配置逐项透传（含 LIMIT/TG 明文解密），conf 缺失则提示手动安装
     if [ -f "$CONF_FILE" ]; then
@@ -729,7 +727,8 @@ menu_update() {
         NETMON_KEY="$NETMON_KEY" TFC_NAME="${TFC_NAME:-tfc}" KEEP_TRAFFIC=1 \
         bash "$SCRIPT_DIR/traffic_ctrl.sh" req
     else
-        echo "--> 未找到 ${CONF_FILE}，跳过重装；请跑菜单 1 完成首次部署。"
+        echo "--> 未找到 ${CONF_FILE}，跳过重装；正在重载新版菜单..."
+        exec bash "$SCRIPT_DIR/traffic_ctrl.sh" menu
     fi
 }
 # 一级菜单网络状态行：绿●正常 / 红■封网中 / 黄○未部署（读 state + 防火墙跳转数）
