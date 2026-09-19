@@ -47,8 +47,7 @@
 
 ```bash
 # 1. 先下载部署脚本到本地保存（封网后断外网也能运行）
-mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chm
-od +x /root/traffic_routing/traffic_ctrl.sh && cd /root/traffic_routing
+mkdir -p /root/traffic_routing && wget -O /root/traffic_routing/traffic_ctrl.sh https://raw.githubusercontent.com/jyucoeng/gcp_traffic_routing/main/netMonitor/traffic_ctrl.sh && chmod +x /root/traffic_routing/traffic_ctrl.sh && cd /root/traffic_routing
 
 # 2. 纯封网版-没有tg通知（gcp 无默认上限，这里显式指定 180GB）
 PLATFORM=gcp LIMIT=180 bash traffic_ctrl.sh
@@ -305,7 +304,7 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 - **CPU**（仅 oracle）：`aarch64`→ARM；型号含 `AMD`/`EPYC`→AMD
 - **恢复通知**：只有上月确实超限封过网（`STATE=blocked`）且 TG 启用才发；上月两行仅有数据时显示；本月恒为 0（刚 reset 清零）
 
-### 状态文件（保证"同一事件周期只发一次"）
+### 状态文件与发送历史（保证"每月各最多 1 条"）
 状态记录在 `/var/lib/traffic_monitor/state`：
 ```
 MONTH=2026-10        # 当前跟踪月份
@@ -319,9 +318,15 @@ USED_TX=0
 USED_RX=0
 USED_BAL=0
 ```
+TG 发送历史记录在 `/var/lib/traffic_monitor/notify`（一行一月，UTC 时间戳）：
+```
+2026-08 OVER=2026-08-19T02:00:00Z RESTORE=2026-09-01T00:00:05Z
+2026-09 OVER=2026-09-19T03:40:10Z RESTORE=-
+```
 - `USED_*` 为**当月流量快照**：每次 check 判定后落盘；每月 reset 清零本月累计后随之归零（上月的最终值归档到 `/var/lib/traffic_monitor/archive`，一行一月）。
-- 同一断网周期内（STATE 已为 `blocked`），重复运行 check 时**不再发超限通知**，避免刷屏。
-- 每月 reset 恢复后，若上月确实断过网且 TG 已启用，才发恢复通知，并进入新月份周期。
+- `notify` 与 `state` 分离存放：删 `state` / 覆盖重装 / 流量回落后同月再超限，都**不重发**（判定只看 `notify`，封网本身每次照常执行）。测试时想重发，手动删文件：`rm -f /var/lib/traffic_monitor/notify`。
+- `notify` 只保留最近 12 个月（每次发送时自动裁剪）；`RESTORE=-` 表示当月恢复通知尚未发送。
+- 每月 reset 恢复后，若上月确实断过网且 TG 启用，才发恢复通知，并进入新月份周期。
 
 ---
 
@@ -385,6 +390,7 @@ iptables -X TRAFFIC_BLOCKED
 | `/var/log/traffic_monitor.log` | 监控日志（每月 1 号按 `LOG_RETENTION_DAYS` 保留最近 N 天，默认 7 天） |
 | `/var/log/network_reset.log` | 重置日志 |
 | `/var/lib/traffic_monitor/state` | 运行状态（当前月/封网状态/断网恢复时刻/当月流量快照 USED_*；卸载时删除） |
+| `/var/lib/traffic_monitor/notify` | TG 发送历史（一行一月 UTC 时间戳，`OVER` 超限 / `RESTORE` 恢复；每月各最多 1 条的判定依据；只留最近 12 个月；卸载保留） |
 | `/var/lib/traffic_monitor/netcount` | 流量月度累计（MONTH + 当月上行/下行字节，由 netstat.sh 持久化；**卸载与覆盖安装均保留**） |
 | `/var/lib/traffic_monitor/archive` | 月度流量档案（每月重置前把上月最终 TX/RX 追加一行，长期留存；含 `mode=` 上月口径与 `blocked=` 封网状态；卸载保留） |
 | `/var/lib/traffic_monitor/grand_total` | 总计流量（从部署到现在的上下行总计，长期累计，卸载不清） |
