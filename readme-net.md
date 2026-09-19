@@ -1,7 +1,7 @@
 # netMonitor — 流量监控自动部署脚本
 
 针对 **gcp / Oracle Cloud** 的 Linux 实例的流量监控与自动止损脚本。
-通过监控网卡**上下行流量**（RX 入站 / TX 出站，分别统计、口径可配），超限后**全局封锁**（INPUT + OUTPUT + FORWARD 三条链跳转至自定义链，链内仅放行 SSH / DNS / lo），并可选通过 TG 通知状态变化。
+通过监控网卡**上下行流量**（RX 入站 / TX 出站，分别统计、口径可配），超限后**全局封锁**（INPUT + OUTPUT + FORWARD 三条链跳转至自定义链，链内仅放行已建立连接 / SSH / DNS / ICMP / lo），并可选通过 TG 通知状态变化。
 也支持其他指定平台（如 aws / azure / hetzner），仅需手动指定上限，见「二、可配置项」。
 
 **完整支持纯 IPv4 / 纯 IPv6 / 双栈 VPS**：部署时自动探测地址族（`HAS_V4`/`HAS_V6`），封网与解网时按地址族分别操作 `iptables`(IPv4) 与 `ip6tables`(IPv6)；DNS 服务器按 IP 类型自动分流到对应表；纯 IPv6 机自动选用 IPv6 DNS 默认值。
@@ -20,7 +20,7 @@
 | `PLATFORM=oracle LIMIT=500 TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash /root/traffic_ctrl.sh` | 同上，并额外在**断网时 / 网络恢复时**发送 Telegram 通知 |
 
 两个 `TELEGRAM_*` 环境变量**均非空**才启用通知；任一为空即纯封网版。
-`PLATFORM` 为小写标识（内置特殊处理 gcp/oracle，其他任意平台可用），用 `PLATFORM` 区分，无需维护多套文件。
+`PLATFORM` 为平台标识（**大小写不敏感，含 `oracle`/`甲骨文` 即触发 oracle 逻辑**，可含中文如 `oracle首尔`，TG 标题原样显示），无需维护多套文件。
 
 > **改配置统一通过子命令，勿手改配置文件。** 部署时全部参数固化到 **`/etc/traffic_routing/netMonitor.conf`**（权限 0600）。
 > 之后调上限/端口/TG/日志保留天数，运行 **`bash /root/traffic_ctrl.sh edit`**（交互式菜单），改完自动加密落盘并即时生效（无需重新部署）。
@@ -34,9 +34,9 @@
 
 | 环境变量 | 说明 | 默认 |
 |------|------|------|
-| `PLATFORM` | 平台标识，**建议统一小写**。内置特殊处理 `gcp`/`oracle`；其他任意标识（如 `aws`/`azure`/`hetzner`/`custom`）也可用，仅需手动指定 `LIMIT` | `gcp` |
-| `LIMIT` | 流量上限（GB），超限触发封网。**无默认值，部署必须显式指定**。留空部署会直接报错；`0`/`-1` = 无限制（永不封网） | 无（必填） |
-| `STAT_MODE` | **计费口径（超限判断用哪个方向流量）**：`in`=只算入站(下行)  `out`=只算出站(上行)  `min`=取上下行中较小者  `max`=取上下行中较大者  `sum`=上下行总和（**所有平台统一默认 sum，无平台分派**）。超限判断 = 按此口径计得的当月字节 与 `LIMIT` 比较；可直接 `edit` 修改 | `sum`(总和) |
+| `PLATFORM` | 平台标识（大小写不敏感，含 `oracle`/`甲骨文` 即触发 oracle 逻辑，可含中文如 `oracle首尔`）；其他任意标识（如 `aws`/`azure`/`hetzner`/`custom`）也可用，仅需手动指定 `LIMIT` | `gcp` |
+| `LIMIT` | 流量上限（GB，支持小数如 `0.0002`≈0.2MB，**无默认值，部署必须显式指定**，留空直接报错；`0`/`-1` = 无限制，永不封网） | 无（必填） |
+| `STAT_MODE` | **计费口径（超限判断用哪个方向流量）**：`in`=入站(下行)  `out`=出站(上行)  `min`=取小  `max`=取大  `sum`=总和（**所有平台统一默认 sum**）。超限判断 = 按此口径计得的当月字节 与 `LIMIT` 比较；可直接 `edit` 修改 | `sum`(总和) |
 | `SSH_PORT` | 封网后仅放行的 SSH 管理端口。**填 VPS 内部 sshd 实际监听的端口**，与外部连接端口无关（见下方 NAT 机说明） | `22` |
 | `DNS_SERVERS` | 封网后允许的 DNS 服务器，支持 IPv4/IPv6 混列；留空则按地址族自动选 | IPv4：`8.8.8.8 8.8.4.4`；纯 IPv6：`2001:4860:4860::8888 2001:4860:4860::8844` |
 | `LOG_RETENTION_DAYS` | 流量监控日志保留天数：每月 1 号清理时只保留最近 N 天的日志行，删除更早的行 | `7`（`0`/`-1`=保留全部） |
@@ -183,19 +183,22 @@ iptables -A TRAFFIC_BLOCKED -m state --state ESTABLISHED,RELATED -j ACCEPT
 iptables -A TRAFFIC_BLOCKED -p tcp --dport $SSH_PORT -j ACCEPT
 iptables -A TRAFFIC_BLOCKED -p tcp --sport $SSH_PORT -j ACCEPT
 iptables -A TRAFFIC_BLOCKED -p udp --dport 53 -d <DNS> -j ACCEPT   # 各 DNS 服务器(按地址族分别加入 iptables/ip6tables)
+iptables -A TRAFFIC_BLOCKED -p tcp --dport 53 -d <DNS> -j ACCEPT   # DNS TCP 兜底（大响应/DoT 降级不断连）
 iptables -A TRAFFIC_BLOCKED -p icmp -j ACCEPT                      # IPv6 用: -p ipv6-icmp
 iptables -A TRAFFIC_BLOCKED -i lo -j ACCEPT
+iptables -A TRAFFIC_BLOCKED -o lo -j ACCEPT
 # 链内兜底 DROP：未放行的流量在本链终结，不回到主链
 iptables -A TRAFFIC_BLOCKED -j DROP
 
-# 在三条主链最顶部各插入一条跳转规则（-I 1），实现全局封锁
+# 在三条主链最顶部各插入一条跳转规则（存在则跳过，避免 cron 重复触发时堆积；旧版无此去重）
+# 实际写法为 -C 检查存在则跳过、否则 -I 1 插入（此处为示意简写）
 iptables -I INPUT   1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
 iptables -I OUTPUT  1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
 iptables -I FORWARD 1 -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED
 ```
 
 **机制说明：**
-- 放行：已建立连接（ESTABLISHED,RELATED）、SSH(`$SSH_PORT` 入/出双向)、DNS(`$DNS_SERVERS`)、ICMP(ping)、loopback。
+- 放行：已建立连接（ESTABLISHED,RELATED）、SSH(`$SSH_PORT` 入/出双向)、DNS(`$DNS_SERVERS`，UDP+TCP 双协议)、ICMP(ping/IPv6 NDP)、loopback(入/出双向)。
 - 其余未放行的出入站及转发流量，在 `TRAFFIC_BLOCKED` 链内被兜底 `DROP` 拦截 → 达到"全局封锁、仅留 SSH/DNS"效果。
 - 因为跳转插在**最顶部**且链内兜底 DROP 是终结动作，其他程序（如程序 a）的 ACCEPT 规则会被本轮封网**覆盖**（但**未被删除**）。
 - 默认策略（`-P`）、其他链的内容、其他程序规则全部保持不变。
@@ -225,7 +228,7 @@ bash /root/traffic_routing/check_traffic.sh
 ### 6. 运行时配置文件 (`/etc/traffic_routing/netMonitor.conf`)
 部署时生成，权限 `0600`，各字段（仅作展示，**改配置请用子命令，勿手改**）：
 ```
-PLATFORM="oracle"                       # 平台（小写）
+PLATFORM="oracle首尔"                    # 平台（大小写不敏感，可含中文，TG 标题原样显示）
 LIMIT=500                               # 流量上限 GB（0/-1=无限制）
 STAT_MODE=sum                           # 计费口径 out/in/min/max/sum
 SSH_PORT=2222                           # SSH 管理端口
@@ -246,11 +249,14 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 ### 7. 子命令一览
 | 子命令 | 作用 |
 |------|------|
+| `req` / `install` | 部署 / 覆盖安装（装完停住，按任意键进菜单） |
+| `menu`（或无参数） | 进入管理菜单（安装/查看/修改/TG/卸载/退出） |
 | `edit` | 交互式菜单修改平台/上限/口径/SSH端口/DNS/TG/日志保留天数（推荐） |
 | `config` | 查看当前配置，凭据掩码显示（中间一半用 `*` 遮蔽） |
 | `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash /root/traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
-| `del` | 卸载（清理 crontab 调度/运行时脚本/conf/日志，**保留密钥与月度档案**） |
+| `del` / `un` | 卸载（删 crontab 调度/运行时脚本/conf/state/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
+| `help` | 显示全部命令用法 |
 
 ---
 
@@ -264,34 +270,38 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | 超限断网前 | `🎮 {PLATFORM} 流量报告（流量超限通知）` | 当月首次流量 ≥ LIMIT，封网前发送 | 当月首次超限时发送 **1 次** |
 | 每月 1 号恢复 | `🎮 {PLATFORM} 流量报告（网络恢复通知）` | 当月曾处于断网状态，reset 恢复后发送 | 每月 1 号最多发送 **1 次** |
 
-### 通知内容（模板）
+### 通知内容（模板，与当前代码一致）
 超限通知：
 ```
-🎮 oracle 流量报告（流量超限通知）
+🎮 oracle首尔 流量报告（流量超限通知）
 
-🌐 本机IP: 152.69.***.146 (Osaka-JP)
-🕐 运行时间: 2026-09-04 10:20:33
+🌐 本机IP: 152.70.235.27 (Seoul-KR)
+🕐 运行时间: 2026-09-19 10:00:00
 📚 网络状态: 正常 ---> 超限(双向封网)
-📊 计费口径: sum (上行 123.45GB / 下行 20.10GB)
-🌐 计费流量: 143.55GB / 上限: 500 GB
-🌐 CPU: AMD        ← 仅 oracle 显示
+📊 计费口径: sum-总和 / 上限: 0.0002 GB (0.20MB)
+🌐 已用流量: 13.71MB / (上行 6.09MB / 下行 7.61MB)
+🌐 CPU: ARM        ← 仅 oracle 显示
 ```
 恢复通知：
 ```
-🎮 oracle 流量报告（网络恢复通知）
+🎮 oracle首尔 流量报告（网络恢复通知）
 
-🌐 本机IP: 152.69.***.146 (Osaka-JP)
+🌐 本机IP: 152.70.235.27 (Seoul-KR)
 🕐 运行时间: 2026-10-01 00:00:02
 📚 网络状态: 超限封网 ---> 已恢复
-🌐 本月流量: 上行 0.00MB / 下行 0.00MB / 上限: 500 GB
-📊 上个月流量: 上行 143.55GB / 下行 ... (重置前耗尽，仅有数据时显示)
-🌐 CPU: AMD        ← 仅 oracle 显示
+📊 计费口径: sum-总和 / 上限: 500 GB
+🌐 已用流量: 0.00MB / (上行 0.00MB / 下行 0.00MB)
+📊 上月计费口径: sum-总和 / 上限: 500 GB
+🌐 上月已用流量: 143.55GB / (上行 123.45GB / 下行 20.10GB) (重置前耗尽，仅有数据时显示)
+🌐 CPU: ARM        ← 仅 oracle 显示
 ```
-- **本机IP**：多来源探测链 `ip-api.com` → `ipwho.is` → `ipify`，全部失败回退本机网卡地址；IPv4 打码 `a.b.***.d`，IPv6 保留首尾一组。城市/国家取 `ip-api.com`（重试 3 次，失败降级仅显示国家 → `unknown`）
-- **流量**：按层级自动换算 `MB → GB → TB`（<1GB 用 MB；<1024GB 用 GB；≥1024GB 用 TB）
-- **运行时间**：服务器当前时间
+- **口径中文名**：`sum-总和` / `out-出站` / `in-入站` / `max-取大` / `min-取小`；上月口径优先用封网当时落盘的 `USED_STAT_MODE`（月中改口径不影响上月显示），缺失回退当前口径
+- **上限换算**：上限恒显示 `X GB`，与已用流量单位不同时括号追加换算值（如 `0.0002 GB (0.20MB)`）；已用为 GB 时不加括号
+- **本机IP**：多来源探测链 `ip-api.com` → `ipwho.is` → `ipify`，全部失败回退本机网卡地址；**当前不打码，原样显示**。城市/国家取 `ip-api.com`（重试 3 次，失败降级仅显示国家 → `unknown`）
+- **流量**：按层级自动换算 `MB → GB → TB`（<1GB 用 MB；<1024GB 用 GB；≥1024GB 用 TB），小数补前导 0（如 `0.65MB`）
+- **运行时间**：北京时间（`TZ='UTC-8'` = UTC+8）
 - **CPU**（仅 oracle）：`aarch64`→ARM；型号含 `AMD`/`EPYC`→AMD
-- **恢复通知**：`网络恢复通知` 只有当月确实超限封过网才发；上个月流量（重置前耗尽）在重置归档后展示
+- **恢复通知**：只有上月确实超限封过网（`STATE=blocked`）且 TG 启用才发；上月两行仅有数据时显示；本月恒为 0（刚 reset 清零）
 
 ### 状态文件（保证"同一事件周期只发一次"）
 状态记录在 `/var/lib/traffic_monitor/state`：
@@ -364,7 +374,7 @@ iptables -X TRAFFIC_BLOCKED
 
 | 文件 | 说明 |
 |------|------|
-| `/root/traffic_ctrl.sh` | 部署脚本本地副本（封网后断外网仍可运行 edit / set-tg 或重新部署） |
+| `/root/traffic_ctrl.sh`（或自选路径如 `/root/traffic_routing/traffic_ctrl.sh`，以实际运行的那份为准） | 部署脚本本地副本（封网后断外网仍可运行 edit / set-tg 或重新部署） |
 | `/root/traffic_routing/check_traffic.sh` | 运行时监控脚本（每 5 分钟 cron 执行：查流量、超限封网、TG 通知） |
 | `/root/traffic_routing/reset_network.sh` | 运行时重置脚本（每月 1 号 cron 执行：清理日志、清封网规则、重置统计、归档、TG 恢复通知） |
 | `/root/traffic_routing/netstat.sh` | 流量统计脚本（nezha 式 /proc/net/dev + 月度增量，无 vnstat 依赖） |
@@ -372,6 +382,8 @@ iptables -X TRAFFIC_BLOCKED
 | `/etc/traffic_routing/netMonitor.key` | TG 凭据 AES-256 加密密钥文件（0600，仅 root 可读；**丢失后凭据不可恢复**，需重新 `set-tg`） |
 | `/var/log/traffic_monitor.log` | 监控日志（每月 1 号按 `LOG_RETENTION_DAYS` 保留最近 N 天，默认 7 天） |
 | `/var/log/network_reset.log` | 重置日志 |
-| `/var/lib/traffic_monitor/state` | 运行状态（当前月/封网状态/断网恢复时刻/当月流量快照 USED_*） |
-| `/var/lib/traffic_monitor/netcount` | 流量月度累计（MONTH + 当月上行/下行字节，由 netstat.sh 持久化） |
-| `/var/lib/traffic_monitor/archive` | 月度流量档案（每月重置前把上月最终 TX/RX 追加一行，长期留存） |
+| `/var/lib/traffic_monitor/state` | 运行状态（当前月/封网状态/断网恢复时刻/当月流量快照 USED_*；卸载时删除） |
+| `/var/lib/traffic_monitor/netcount` | 流量月度累计（MONTH + 当月上行/下行字节，由 netstat.sh 持久化；**卸载与覆盖安装均保留**） |
+| `/var/lib/traffic_monitor/archive` | 月度流量档案（每月重置前把上月最终 TX/RX 追加一行，长期留存；含 `mode=` 上月口径与 `blocked=` 封网状态；卸载保留） |
+| `/var/lib/traffic_monitor/grand_total` | 总计流量（从部署到现在的上下行总计，长期累计，卸载不清） |
+| `/var/lib/traffic_monitor/netcount_YYYY-MM` | 月度快照（每月 reset 时归档 netcount，只留最近 12 个月） |
