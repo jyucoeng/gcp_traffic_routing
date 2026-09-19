@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.7}"
+VERSION="${VERSION:-v1.0.8}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -131,7 +131,7 @@ resolve_dns() {
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo "错误：请使用 root 权限运行此脚本。" >&2
-        exit 1
+        return 1
     fi
 }
 
@@ -300,11 +300,11 @@ tg_set() {
     require_root
     if [ ! -f "$CONF_FILE" ]; then
         echo "错误：未找到 ${CONF_FILE}，请先部署（bash traffic_ctrl.sh）再设置 TG。" >&2
-        exit 1
+        return 1
     fi
     if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
         echo "用法：TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy bash $0 set-tg" >&2
-        exit 1
+        return 1
     fi
     # 读取现有配置以保留其余字段
     . "$CONF_FILE"
@@ -322,7 +322,7 @@ tg_clear() {
     require_root
     if [ ! -f "$CONF_FILE" ]; then
         echo "错误：未找到 ${CONF_FILE}，请先部署。" >&2
-        exit 1
+        return 1
     fi
     . "$CONF_FILE"
     INTERFACE="${INTERFACE:-}"
@@ -360,13 +360,24 @@ tg_notify_reset() {
     fi
 }
 
+# 共用菜单头：一级/二级/config 统一（标题+作者+版本+网络状态+快捷指令）
+menu_header() {
+    echo "========================="
+    echo " 小鸡流量限制管理脚本"
+    echo " Author：${AUTHOR}"
+    echo " Version: ${VERSION}"
+    echo " 网络状态：$(menu_net_status)"
+    echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
+    echo "========================="
+}
+
 # ---------------- 子命令：config ----------------
 # 查看当前运行时配置；TG 凭据解密后以掩码显示（保留前4后4，隐藏中间）。
 config_show() {
     require_root
     if [ ! -r "$CONF_FILE" ]; then
         echo "错误：未找到 ${CONF_FILE}，请先部署（bash traffic_ctrl.sh）。" >&2
-        exit 1
+        return 1
     fi
     . "$CONF_FILE"
     TELEGRAM_BOT_TOKEN_ENC="${TELEGRAM_BOT_TOKEN_ENC:-}"
@@ -377,11 +388,7 @@ config_show() {
     t="$(dec_tg "$TELEGRAM_BOT_TOKEN_ENC")"
     c="$(dec_tg "$TELEGRAM_CHAT_ID_ENC")"
 
-    echo "========================="
-    echo " 小鸡流量限制管理脚本"
-    echo " Author：${AUTHOR}"
-    echo " Version: ${VERSION}"
-    echo "========================="
+    menu_header
     echo "平台         : ${PLATFORM:-gcp}"
     echo "流量上限     : ${LIMIT:-未设置} GB"
     echo "流量口径     : ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
@@ -390,11 +397,11 @@ config_show() {
     echo "网卡接口     : ${INTERFACE:-}"
     echo "日志保留     : ${LOG_RETENTION_DAYS:-7} 天 (只保留最近 N 天, 0/-1=保留全部)"
     if [ -n "$t" ] && [ -n "$c" ]; then
-        echo "TG 通知      : 已启用"
+        echo -e "TG 通知      : \033[32m已启用\033[0m"
         echo "  BOT TOKEN  : $(mask_mid "$t")  (长度 ${#t})"
         echo "  CHAT ID    : $(mask_mid "$c")  (长度 ${#c})"
     else
-        echo "TG 通知      : 未启用"
+        echo -e "TG 通知      : \033[31m未启用\033[0m"
     fi
     echo "配置文件     : $CONF_FILE (0600)"
     echo "密钥文件     : $NETMON_KEY (0600)"
@@ -407,7 +414,7 @@ config_edit() {
     require_root
     if [ ! -f "$CONF_FILE" ]; then
         echo "错误：未找到 ${CONF_FILE}，请先部署（bash traffic_ctrl.sh）。" >&2
-        exit 1
+        return 1
     fi
     . "$CONF_FILE"
     TELEGRAM_BOT_TOKEN_ENC="${TELEGRAM_BOT_TOKEN_ENC:-}"
@@ -438,11 +445,7 @@ config_edit() {
 
     while :; do
         echo ""
-        echo "========================="
-        echo " 小鸡流量限制管理脚本"
-        echo " Author：${AUTHOR}"
-        echo " Version: ${VERSION}"
-        echo "========================="
+        menu_header
         echo "  平台 PLATFORM    : ${PLATFORM:-gcp}"
         echo "  流量上限 LIMIT   : ${LIMIT:-未设置} GB (0/-1=无限制)"
         echo "  流量口径 STAT_MODE: ${STAT_MODE:-sum} (out=出站 in=入站 max=取大 min=取小 sum=总和)"
@@ -450,7 +453,8 @@ config_edit() {
         echo "  DNS 服务器       : ${DNS_SERVERS:-8.8.8.8 8.8.4.4}"
         echo "  网卡接口         : ${INTERFACE:-}"
         echo "  日志保留天数     : ${LOG_RETENTION_DAYS:-7} (只保留最近 N 天, 0/-1=保留全部)"
-        echo "  TG 通知          : $([ -n "$t" ] && [ -n "$c" ] && echo "已启用" || echo "未启用")"
+        if [ -n "$t" ] && [ -n "$c" ]; then _tg_st="$(printf '\033[32m已启用\033[0m')"; else _tg_st="$(printf '\033[31m未启用\033[0m')"; fi
+        echo "  TG 通知          : $_tg_st"
         echo "========================================"
         echo " 1) 修改平台         2) 修改流量上限(0/-1=无限制)"
         echo " 3) 修改流量口径     4) 修改 SSH 端口"
@@ -754,7 +758,8 @@ menu_net_status() {
         printf '\033[32m● 正常\033[0m'
     fi
 }
-# 菜单停顿：子操作完成后停住，按任意键回菜单（非交互 stdin 下直接回菜单）
+# 菜单停顿：子操作完成后停住，按任意键回菜单（非交互 stdin 下直接回菜单）；
+# 子函数 exit 会终结整个菜单进程，故调用处统一加 || true 兜底
 menu_pause() {
     printf "\033[32m按任意键返回菜单...\033[0m"
     read -r -n1 _k < /dev/tty 2>/dev/null || read -r _k 2>/dev/null || true
@@ -764,13 +769,7 @@ main_menu() {
     require_root
     while :; do
         echo ""
-        echo "========================="
-        echo " 小鸡流量限制管理脚本"
-        echo " Author：${AUTHOR}"
-        echo " Version: ${VERSION}"
-        echo " 网络状态：$(menu_net_status)"
-        echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
-        echo "========================="
+        menu_header
         echo " 1) 安装"
         echo " 2) 覆盖安装"
         echo " 3) 查看当前配置"
@@ -790,41 +789,41 @@ main_menu() {
                 if [ -f "${CONF_FILE:-/etc/traffic_routing/netMonitor.conf}" ]; then
                     echo "检测到已有部署，如需覆盖请选 2) 覆盖安装。"
                 else
-                    menu_install_ask 1 && do_install
+                    menu_install_ask 1 && do_install || true
                 fi
                 menu_pause
                 ;;
             2)
-                menu_install_ask 2 && do_install
+                menu_install_ask 2 && do_install || true
                 menu_pause
                 ;;
             3)
-                config_show
+                config_show || true
                 menu_pause
                 ;;
             4)
-                config_edit
+                config_edit || true
                 ;;
             5)
-                menu_check
+                menu_check || true
                 menu_pause
                 ;;
             6)
                 printf "确认恢复网络？将清除封网规则并重置当月统计 (y/N): "; read -r a
                 case "$a" in
-                    y|Y|yes|YES) menu_restore ;;
+                    y|Y|yes|YES) menu_restore || true ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 menu_pause
                 ;;
             7)
-                menu_update
+                menu_update || true
                 menu_pause
                 ;;
             8)
                 printf "确认重置本月 TG 发送计数？超限/恢复通知可重新各发 1 条 (y/N): "; read -r a
                 case "$a" in
-                    y|Y|yes|YES) tg_notify_reset ;;
+                    y|Y|yes|YES) tg_notify_reset || true ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 menu_pause
@@ -832,7 +831,7 @@ main_menu() {
             9)
                 printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
                 case "$a" in
-                    y|Y|yes|YES) uninstall ;;
+                    y|Y|yes|YES) uninstall || true ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 menu_pause
@@ -955,7 +954,7 @@ if [ "$OS" = "alpine" ]; then
         echo "错误：以下工具安装失败:$MISSING" >&2
         echo "提示：请检查 /etc/apk/repositories 源可用性，或手动执行:" >&2
         echo "  apk add --no-cache bc curl openssl iptables iptables-openrc ip6tables ip6tables-openrc tzdata bash iproute2" >&2
-        exit 1
+        return 1
     fi
     # alpine 无 systemd，服务管理用 openrc / rc-service
     SVC_MGR=openrc
@@ -971,7 +970,7 @@ else
     if [ -n "$MISSING" ]; then
         echo "错误：以下工具安装失败:$MISSING" >&2
         echo "提示：请手动执行: apt-get update && apt-get install bc curl openssl iptables ip6tables" >&2
-        exit 1
+        return 1
     fi
     SVC_MGR=systemd
 fi
