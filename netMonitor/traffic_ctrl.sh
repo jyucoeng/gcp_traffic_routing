@@ -528,6 +528,87 @@ config_edit() {
 
 # ---------------- 子命令：menu / 默认入口 ----------------
 # 不加参数或 menu 子命令进入管理菜单（部署/查看/修改/卸载/退出）
+# 菜单安装参数 pergunta：$1=1 全新 / 2 覆盖；逐项列出让用户确认（回车保留默认）；
+# 全新用硬默认，覆盖读现 conf 做默认；LIMIT 必填（两处都无默认时必须输入）；
+# 返回 0=继续安装，1=取消。无交互 req 不走这里（环境变量直装）。
+menu_install_ask() {
+    _mode="$1"
+    _cf="${CONF_FILE:-/etc/traffic_routing/netMonitor.conf}"
+    if [ "$_mode" = "2" ] && [ -f "$_cf" ]; then
+        . "$_cf"
+        _d_platform="${PLATFORM:-gcp}"
+        _d_limit="${LIMIT:-}"
+        _d_stat="${STAT_MODE:-sum}"
+        _d_ssh="${SSH_PORT:-22}"
+        _d_dns="${DNS_SERVERS:-}"
+        _d_log="${LOG_RETENTION_DAYS:-7}"
+        _has_tg=0
+        [ -n "${TELEGRAM_BOT_TOKEN_ENC:-}" ] && [ -n "${TELEGRAM_CHAT_ID_ENC:-}" ] && _has_tg=1
+    else
+        _d_platform="${PLATFORM:-gcp}"
+        _d_limit="${LIMIT:-}"
+        _d_stat="${STAT_MODE:-sum}"
+        _d_ssh="${SSH_PORT:-22}"
+        _d_dns="${DNS_SERVERS:-}"
+        _d_log="${LOG_RETENTION_DAYS:-7}"
+        _has_tg=0
+    fi
+    echo ""
+    echo "--- 安装参数确认（回车保留默认值）---"
+    printf "平台 PLATFORM [%s]: " "$_d_platform"; read -r v || return 1
+    [ -n "$v" ] && PLATFORM="$v" || PLATFORM="$_d_platform"
+    while :; do
+        if [ -n "$_d_limit" ]; then
+            printf "流量上限 LIMIT(GB) [%s]: " "$_d_limit"; read -r v || return 1
+            [ -z "$v" ] && v="$_d_limit"
+        else
+            printf "流量上限 LIMIT(GB, 必填): "; read -r v || return 1
+        fi
+        case "$v" in
+            -1|0) LIMIT="$v"; break ;;
+            *[!0-9.]*) echo "无效上限（仅允许非负数，0/-1=无限制）。" ;;
+            *) LIMIT="$v"; break ;;
+        esac
+    done
+    printf "流量口径 STAT_MODE [in入站/out出站/max取大/min取小/sum总和, 默认 %s]: " "$_d_stat"; read -r v || return 1
+    case "$v" in
+        in|out|max|min|sum) STAT_MODE="$v" ;;
+        "") STAT_MODE="$_d_stat" ;;
+        *) echo "无效口径，用默认值 $_d_stat。" ; STAT_MODE="$_d_stat" ;;
+    esac
+    printf "SSH 端口 [%s]: " "$_d_ssh"; read -r v || return 1
+    [ -n "$v" ] && SSH_PORT="$v" || SSH_PORT="$_d_ssh"
+    printf "DNS 服务器(空格分隔, 留空自动) [%s]: " "${_d_dns:-自动}"; read -r v || return 1
+    [ -n "$v" ] && DNS_SERVERS="$v" || DNS_SERVERS="$_d_dns"
+    if [ "$_has_tg" = "1" ]; then
+        printf "TG 凭据 [已启用，回车保留，输入 clear 清除]: "; read -r v || return 1
+        case "$v" in
+            clear|CLEAR) TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID="" ;;
+            "") : ;;
+            *) echo "提示：更换 TG 请用 4) 修改配置 或 set-tg，此处仅保留/清除。" ;;
+        esac
+    else
+        printf "TG Bot Token (留空不启用): "; read -rs _nt; echo
+        printf "TG Chat ID (留空不启用): "; read -rs _nc; echo
+        if [ -n "$_nt" ] && [ -n "$_nc" ]; then
+            TELEGRAM_BOT_TOKEN="$_nt"; TELEGRAM_CHAT_ID="$_nc"
+        elif [ -n "$_nt" ] || [ -n "$_nc" ]; then
+            echo "TG 凭据不完整（需同时填写），本次不启用。"
+            TELEGRAM_BOT_TOKEN=""; TELEGRAM_CHAT_ID=""
+        fi
+    fi
+    printf "日志保留天数 [%s]: " "$_d_log"; read -r v || return 1
+    case "$v" in
+        "") LOG_RETENTION_DAYS="$_d_log" ;;
+        -1|0) LOG_RETENTION_DAYS="$v" ;;
+        *[!0-9]*) echo "无效天数，用默认值 $_d_log。" ; LOG_RETENTION_DAYS="$_d_log" ;;
+        *) LOG_RETENTION_DAYS="$v" ;;
+    esac
+    echo ""
+    echo "确认安装参数：平台=$PLATFORM 上限=${LIMIT}GB 口径=$STAT_MODE SSH=$SSH_PORT 日志保留=$LOG_RETENTION_DAYS 天"
+    printf "开始安装？(y/N): "; read -r a || return 1
+    case "$a" in y|Y|yes|YES) return 0 ;; *) echo "-> 已取消。" ; return 1 ;; esac
+}
 # 查看流量：直接跑运行时 check 脚本（查当月上下行 + 超限判定 + 封网；未部署时提示）
 menu_check() {
     if [ -x "$SCRIPT_DIR/check_traffic.sh" ]; then
@@ -658,14 +739,15 @@ main_menu() {
         echo " 网络状态：$(menu_net_status)"
         echo " 快捷指令：${TFC_NAME:-tfc}（如 ${TFC_NAME:-tfc} check / ${TFC_NAME:-tfc} config）"
         echo "========================="
-        echo " 1) 安装 / 覆盖安装"
-        echo " 2) 查看当前配置"
-        echo " 3) 修改配置（交互菜单，含 TG）"
-        echo " 4) 查看流量"
-        echo " 5) 恢复网络"
-        echo " 6) 脚本更新"
-        echo " 7) 重置本月 TG 发送计数"
-        echo " 8) 卸载"
+        echo " 1) 安装"
+        echo " 2) 覆盖安装"
+        echo " 3) 查看当前配置"
+        echo " 4) 修改配置（交互菜单，含 TG）"
+        echo " 5) 查看流量"
+        echo " 6) 恢复网络"
+        echo " 7) 脚本更新"
+        echo " 8) 重置本月 TG 发送计数"
+        echo " 9) 卸载"
         echo " 0) 退出"
         echo "========================="
         printf "请选择: "
@@ -673,35 +755,42 @@ main_menu() {
 
         case "$opt" in
             1)
-                do_install
+                if [ -f "${CONF_FILE:-/etc/traffic_routing/netMonitor.conf}" ]; then
+                    echo "检测到已有部署，如需覆盖请选 2) 覆盖安装。"
+                else
+                    menu_install_ask 1 && do_install
+                fi
                 ;;
             2)
-                config_show
+                menu_install_ask 2 && do_install
                 ;;
             3)
-                config_edit
+                config_show
                 ;;
             4)
-                menu_check
+                config_edit
                 ;;
             5)
+                menu_check
+                ;;
+            6)
                 printf "确认恢复网络？将清除封网规则并重置当月统计 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) menu_restore ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 ;;
-            6)
+            7)
                 menu_update
                 ;;
-            7)
+            8)
                 printf "确认重置本月 TG 发送计数？超限/恢复通知可重新各发 1 条 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) tg_notify_reset ;;
                     *) echo "-> 已取消。" ;;
                 esac
                 ;;
-            8)
+            9)
                 printf "确认卸载？封网规则与部署物将被清理，密钥与月度档案保留 (y/N): "; read -r a
                 case "$a" in
                     y|Y|yes|YES) uninstall ;;
