@@ -59,7 +59,7 @@ set -eEuo pipefail
 # 无 VERSION 时回退到下方字面量。字面量必须以版本门禁 check-version.sh 钉死为：
 #   "v${SCRIPT_VERSION}" 恒等于 VERSION 文件内容
 # （发布脚本会据此在构建/门禁阶段校验二者一致，此处仅为独立安装兜底）。
-SCRIPT_VERSION="0.1.2"
+SCRIPT_VERSION="0.1.3"
 if [ -s "$(dirname "${BASH_SOURCE[0]}")/VERSION" ]; then
   SCRIPT_VERSION="$(tr -d '\r\n' <"$(dirname "${BASH_SOURCE[0]}")/VERSION")"
   SCRIPT_VERSION="${SCRIPT_VERSION#v}"
