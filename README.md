@@ -95,14 +95,26 @@ cdn            # 安装 dae + geoip + 配置（需 root）
 > 以下 `UUID`、`密码`、`IP`、`端口` 均为**占位符**，换成你自己的真实值即可。
 > 脚本本身不内置任何节点；无实例可用时换节点永远是一条命令 + 自动重启，不用重装。
 
-**新机器一条龙（install 时顺手把第一个节点也加了）**
+**新机器一条龙（安装 + 加节点一步到位）**
+
+先安装管理器（下载发布包、SHA 校验、落盘 `cdn` 脚本）：
 
 ```bash
-# 安装 dae + CDN 网段清单，并把第一对节点直接落进去（等价于 install 后再 add，但只敲一次）
+curl -fsSL https://github.com/jyucoeng/gcp_traffic_routing/releases/latest/download/install.sh | bash
+```
+
+再初始化 dae + CDN 网段清单，并把第一对节点直接落进去
+（`cdn install <节点…>` = 等价于 `install` 后再 `cdn add`，但只敲一次）：
+
+```bash
+# 安装 dae + CDN 网段清单，并直接把节点写进节点池（自动 apply）
 cdn install \
   'vless://UUID@IP:端口?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.apple.com&fp=chrome&pbk=公钥&sid=短id&type=tcp&headerType=none' \
   'tuic://UUID:密码@IP:端口?sni=www.apple.com&congestion_control=bbr&security=tls&udp_relay_mode=native&alpn=h3&allow_insecure=1'
 ```
+
+> 注意：`cdn install` 才能"安装 + 加节点"一步完成；`cdn add` 只添加节点，
+> 不会安装 dae（未安装时会提示先执行 `cdn install`）。
 
 **已有服务，只想加/换节点（`add` / `del` 都自动 apply+重启，不用敲 `cdn apply`）**
 
