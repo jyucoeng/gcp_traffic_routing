@@ -169,7 +169,50 @@ DEBUG cache hit _qname=ipinfo.io. dest=169.254.169.254:53 … qtype=A …
 /var/log/dae/dae.log             # 统一日志（dae --logfile，30MB×3 轮转）
 ```
 
-## 五、实测记录（v1.0.0 @ Debian 13 VPS）
+## 五、卸载流程
+
+### 5.1 一键全量卸载
+
+```bash
+cdn un
+```
+
+`cdn un` 一次性删除：dae systemd/openrc 服务（禁用+停止+删单元文件）、
+dae 二进制、geoip 数据库、config.dae、节点/订阅清单、CDN 网段缓存、
+统一日志目录。**保留** `/usr/local/bin/cdn` 脚本本身（可随时重新初始化）。
+
+### 5.2 卸载后验证
+
+```bash
+systemctl status dae        # 预期: Unit dae.service could not be found
+ls /usr/local/bin/dae       # 预期: No such file or directory
+ls /usr/local/etc/dae       # 预期: 不存在
+ls /usr/local/etc/cdn-manager   # 预期: 不存在
+ls /usr/local/share/dae     # 预期: 不存在
+```
+
+### 5.3 彻底卸载（连 cdn 脚本一起删）
+
+```bash
+cdn un
+rm -f /usr/local/bin/cdn     # 手动删管理器脚本
+```
+
+或走交互菜单：`cdn menu` → 选 3「全量卸载」→ 确认 y，脚本会连自身一起移除。
+
+### 5.4 卸载实测记录（Debian 13 VPS，v1.0.0）
+
+```text
+卸载前: dae.service active，/usr/local/bin/cdn (1.0.0) + dae 存在
+执行:   cdn un
+输出:   [OK] CDN 分流管理器已全量卸载（dae 服务/二进制/geoip/配置/节点/CDN 网段缓存）。
+验证:   systemctl status dae → Unit dae.service could not be found
+        /usr/local/bin/dae、/usr/local/etc/dae、/usr/local/etc/cdn-manager、
+        /usr/local/share/dae 全部不存在
+残留:   /usr/local/bin/cdn 保留（如需删除见 5.3）
+```
+
+## 六、实测记录（v1.0.0 @ Debian 13 VPS）
 
 ```text
 部署: cdn un（卸载 0.1.2）→ 上传 v1.0.0 → cdn install → cdn add 双节点
