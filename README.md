@@ -313,6 +313,93 @@ tests/test-install.sh             # install.sh 函数级测试
 bundle 为字节级可复现产物（`tar --format=gnu` + `gzip -n`），`install.sh` 内
 `PACKAGE_SHA256` 与其严格一致。
 
+## 上线清单（发布前逐项核对）
+
+发布新版本时按以下顺序执行，全部 ✅ 才可发 Release：
+
+| # | 检查项 | 命令/位置 | 通过标准 |
+|---|---|---|---|
+| 1 | 版本号三处一致 | `VERSION` / `cdn.sh` 的 `SCRIPT_VERSION` / `install.sh` 的 `PROJECT_VERSION` | 三者统一为 `vX.Y.Z` |
+| 2 | 语法检查 | `bash -n` 全部脚本 | 无报错 |
+| 3 | 功能冒烟 | `bash tests/smoke.sh` | 全部 ✅ 通过 |
+| 4 | 安装流程测试 | `bash tests/test-install.sh` | 全部 ✅ 通过 |
+| 5 | 构建 bundle | `bash scripts/build-release-bundle.sh` | 产出 `dist/<仓库名>-vX.Y.Z.tar.gz` |
+| 6 | 回填 SHA | 把 `cat dist/checksums.txt` 的哈希写回 `install.sh` 的 `PACKAGE_SHA256` | 与 bundle 一致 |
+| 7 | 最终门禁 | `bash scripts/check-version.sh` | 10/10 ✅ 全绿 |
+| 8 | 提交推送 | `git add … && git commit && git push origin main` | 远端 main 为最新 |
+| 9 | 打 tag | `git tag vX.Y.Z && git push origin vX.Y.Z` | 远端出现该 tag |
+| 10 | 建 Release | GitHub Releases 页新建（或编辑已有 tag） | 见下方「部署说明」 |
+| 11 | 上传资产 | 上传两个文件到 Release | 见下方「部署说明」 |
+| 12 | 线上可下载 | `curl -sIL <PACKAGE_URL>` 返回 200 | 资产生效（刚上传偶有 CDN 延迟） |
+
+> 版本号升级只需改三处：`VERSION`（去 `v` 前缀后须与 `cdn.sh` 字面量相等）、
+> `cdn.sh` 顶部 `SCRIPT_VERSION="X.Y.Z"`、`install.sh` 顶部 `PROJECT_VERSION="vX.Y.Z"`。
+> 其余脚本自动读取，无需手改。
+
+## 部署说明（新机器 / 升级）
+
+### 方式一：官方一键安装（推荐，含 bundle SHA256 校验）
+
+```bash
+curl -fsSL https://github.com/jyucoeng/gcp_traffic_routing/releases/latest/download/install.sh | bash
+```
+
+install.sh 会自动：下载发布包 → SHA256 校验（与 `PACKAGE_SHA256` 比对）→
+安装 `cdn` 到 `/usr/local/bin/cdn` → 随包 CDN 网段清单落盘到
+`/usr/local/share/dae/cdnip/`。装完后再初始化：
+
+```bash
+cdn install                     # 安装 dae + geoip.dat + 生成配置
+cdn add '<tuic/vless 节点链接>'  # 添加分流节点（自动 apply 生效）
+```
+
+> 想一条命令完成安装 + 初始化：`cdnt=1 bash install.sh`（install.sh 装完后自动跑 `cdn install`）。
+
+### 方式二：手动部署（离线 / 自定义路径）
+
+```bash
+# 1. 上传源码文件到目标机（cdn.sh + 7 个 CDN 网段 txt + VERSION）
+# 2. 落盘
+install -m 0755 cdn.sh /usr/local/bin/cdn
+install -m 0644 *.txt /usr/local/share/dae/cdnip/
+# 3. 初始化
+cdn install
+cdn add '<tuic://…>' '<vless://…>'
+```
+
+### 部署后验收（必须看到分流生效）
+
+```bash
+# ① 服务状态
+cdn status                       # dae active，两组 + 日志路径正常
+
+# ② 四路分流实测（CDN 走节点 / 非 CDN 直连本机）
+curl -4 -sS https://www.cloudflare.com/cdn-cgi/trace | grep ^ip=; \
+curl -4 -sS -o /dev/null -w 'fastly:%{http_code}\n' https://www.fastly.com/; \
+curl -4 -sS -o /dev/null -w 'akamai:%{http_code}\n' https://www.akamai.com/; \
+curl -4 -sS https://ipinfo.io/ip; echo
+
+# ③ 日志佐证
+grep -E "outbound=cdn_(cache|geoip)_group" /var/log/dae/dae.log | tail
+```
+
+预期：CDN 站点出口 = 节点 IP（非本机），非 CDN 出口 = 本机公网 IP，
+日志出现 `outbound=cdn_cache_group … dialer=节点名` 行。
+
+### 升级已有部署
+
+```bash
+cdn update    # 强制重下 dae 二进制 + geoip + 重建 CDN 缓存并重新 apply
+# 或先卸载再装：cdn un && 按上面「方式一/二」重新部署
+```
+
+### 卸载
+
+```bash
+cdn un        # 删除 dae 服务/二进制/geoip/配置/节点/CDN 缓存（保留 cdn 脚本）
+# 交互菜单里选 3 全量卸载则连 cdn 脚本一并删除
+```
+
 ## Fork 并弄成你自己的项目
 
 项目采用**单一事实源**设计：所有仓库/项目标识都从 `install.sh` 顶部常量派生，
