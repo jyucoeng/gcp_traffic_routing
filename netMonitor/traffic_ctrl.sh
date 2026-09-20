@@ -50,7 +50,7 @@ PLATFORM="${PLATFORM:-gcp}"
 # --- 作者 / 版本（部署期常量，落盘 conf，菜单统一读取展示）---
 # AUTHOR: 脚本作者署名；VERSION: 与仓库根 VERSION 文件保持一致，升级时同步手改
 AUTHOR="${AUTHOR:-littleDoraemon}"
-VERSION="${VERSION:-v1.0.15}"
+VERSION="${VERSION:-v1.0.16}"
 
 # 出站流量上限 (GB)，超过该值触发封网
 LIMIT="${LIMIT:-}"
@@ -997,16 +997,19 @@ if [ "$OS" = "alpine" ]; then
     SVC_MGR=openrc
 else
     apt-get update -y
-    apt-get install bc curl openssl iptables ip6tables -y \
+    # Debian 12+ 的 ip6tables 随 iptables 包一并提供，不再是独立包；
+    # 直接按包名安装 ip6tables 会报 "Unable to locate package" 并拖垮整批安装。
+    apt-get install bc curl openssl iptables -y \
         || apt-get install -f -y
     # 逐个校验关键工具是否就绪，缺失则明确报错
+    # （ip6tables 由 iptables 包提供；校验命令存在性而非包名）
     MISSING=""
     for _t in bc curl openssl iptables ip6tables; do
         command -v "$_t" >/dev/null 2>&1 || MISSING="$MISSING $_t"
     done
     if [ -n "$MISSING" ]; then
         echo "错误：以下工具安装失败:$MISSING" >&2
-        echo "提示：请手动执行: apt-get update && apt-get install bc curl openssl iptables ip6tables" >&2
+        echo "提示：请手动执行: apt-get update && apt-get install bc curl openssl iptables" >&2
         return 1
     fi
     SVC_MGR=systemd
