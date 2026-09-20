@@ -12,7 +12,7 @@ DISK_SIZE="30GB"
 DISK_TYPE="pd-standard"
 NETWORK_TIER="STANDARD"
 PROVISIONING_MODEL="STANDARD"
-TAGS="nocdn"
+TAGS="nocdn,http-server,https-server"
 
 BATCH_SIZE=2
 MAX_IPS=4                  # 区域外部IP配额上限
