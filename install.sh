@@ -10,7 +10,7 @@ umask 077
 # =============================================================================
 REPO_OWNER="jyucoeng"                 # 你的 GitHub 用户名
 REPO_NAME="gcp_traffic_routing"       # 你的仓库名（保持与仓库 URL 一致）
-PROJECT_VERSION="v0.1.3"              # 发布版本号（与 VERSION 文件一致）
+PROJECT_VERSION="v1.0.0"              # 发布版本号（与 VERSION 文件一致）
 PACKAGE_NAME="${REPO_NAME}-${PROJECT_VERSION}.tar.gz"   # 由上方常量派生，无需手改
 
 # 随包 CDN 网段清单（必须与 cdn.sh 的 CDN_CDNIP_FILES 一致，check-version.sh 会交叉校验）
@@ -18,7 +18,7 @@ CDN_CDNIP_FILES="1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastl
 # 随包离线清单落盘目录（cdn.sh 离线优先读取的默认路径）
 CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256="59c1e580ee974b2de9193e44d90b237378ab44d3338afe0abaaccbf85eed3e41"
+PACKAGE_SHA256="96b335582758ab90959d08366cfe0a87308956cb64d3e5012aa22a33dc9a181e"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"
