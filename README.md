@@ -200,6 +200,54 @@ DEBUG 2603:c021:…:41614 <-> www.cloudflare.com:443 dialer=小叮当-…-tuic-S
 可用 `cdn_log_level` 调低级别（如 `info`）减少输出，日志文件路径用
 `DAE_LOG_FILE` 覆盖；`cdn status` 也会显示当前日志文件位置。
 
+## 分流验证（一键自测）
+
+### 一键命令（在 VPS 上执行）
+
+同时访问三大 CDN 站点 + 一个非 CDN 站点，直接对比出口 IP：
+
+```bash
+curl -4 -sS https://www.cloudflare.com/cdn-cgi/trace | grep ^ip=; \
+curl -4 -sS -o /dev/null -w 'fastly:%{http_code}\n' https://www.fastly.com/; \
+curl -4 -sS -o /dev/null -w 'akamai:%{http_code}\n' https://www.akamai.com/; \
+curl -4 -sS https://ipinfo.io/ip; echo
+```
+
+预期结果（CDN 走节点、非 CDN 直连本机）：
+
+```text
+ip=192.9.158.37      ← CDN 出口 = 你的节点 IP
+fastly:200           ← Fastly 访问成功
+akamai:403           ← Akamai 反爬拦截（流量已走通，属正常）
+161.33.136.221       ← 非 CDN 出口 = VPS 本机 IP
+```
+
+### 测试站点对照表
+
+| 类型 | 站点 | URL | 预期 |
+|---|---|---|---|
+| CDN | Cloudflare | `https://www.cloudflare.com/cdn-cgi/trace` | `ip=` 为节点 IP |
+| CDN | Fastly | `https://www.fastly.com/` | HTTP 200 |
+| CDN | Akamai | `https://www.akamai.com/` | HTTP 200/403（403 为反爬，属正常） |
+| 非 CDN | ipinfo.io | `https://ipinfo.io/ip` | 返回 VPS 本机公网 IP |
+
+> 也可换其他 CDN 域名测试：`https://www.jsdelivr.com/`（Cloudflare）、
+> `https://www.cdn77.com/`（CDN77）等。
+
+### 结合日志核对
+
+访问上述站点后，在 VPS 上抓取对应分流明细佐证：
+
+```bash
+grep -E "outbound=cdn_(cache|geoip)_group" /var/log/dae/dae.log | tail -n 10
+# 只查某个域名：grep "sniffed=www.cloudflare.com" /var/log/dae/dae.log
+# 实时跟踪：tail -f /var/log/dae/dae.log | grep -E "outbound=cdn_(cache|geoip)_group"
+```
+
+CDN 流量应出现 `outbound=cdn_cache_group … dialer=节点名`（缓存命中）或
+`outbound=cdn_geoip_group …`（geoip 命中）；非 CDN 流量无 `outbound=cdn_*` 记录，
+即 `fallback: direct` 直连。
+
 ## 环境变量
 
 | 变量 | 说明 |

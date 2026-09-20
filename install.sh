@@ -18,7 +18,7 @@ CDN_CDNIP_FILES="1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastl
 # 随包离线清单落盘目录（cdn.sh 离线优先读取的默认路径）
 CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256="1b31437ea7fa5c9012b45417921fc901d3e28b89cb7200b90b7c629c950a41ec"
+PACKAGE_SHA256="8585818bed2a016c235102bdb316a7a420c3b3c405f1eccf8f2d60357bfcc358"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"
