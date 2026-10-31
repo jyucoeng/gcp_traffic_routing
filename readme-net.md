@@ -258,7 +258,7 @@ TELEGRAM_CHAT_ID_ENC="U2FsdGVkX1..."    # AES-256 密文（勿手改，用 set-t
 | `set-tg` | 更换 TG 凭据（`TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... bash traffic_ctrl.sh set-tg`） |
 | `clear-tg` | 停用通知并清除凭据 |
 | `check` | 查看流量（跑 `check_traffic.sh`：查当月上下行 + 超限判定 + 封网） |
-| `restore` | 恢复网络（跑 `reset_network.sh`：清封网 + 重置统计 + 归档） |
+| `restore` | 立即解封（只撤封网规则并把状态置回 `normal`；不动当月累计与月度档案） |
 | `del` / `un` | 卸载（清本脚本封网规则 + 删 crontab 调度/运行时脚本/conf/state/notify/日志；**保留密钥 key 与月度档案 archive、流量累计 netcount**） |
 | `help` | 显示全部命令用法 |
 
@@ -344,16 +344,18 @@ iptables -L INPUT -n | grep -c TRAFFIC_BLOCKED   # 1=封着，0=正常（双栈�
 cat /var/lib/traffic_monitor/state | grep STATE  # blocked=封着，normal=正常
 ```
 
-### 2. 解封（推荐用 reset 脚本）
+### 2. 解封（推荐 `tfc restore`）
 
-每月 1 号 `reset_network.sh` 会自动恢复。手动立即解封首选直接跑 reset 脚本（清防火墙 + 重置统计 + 写 archive，TG 恢复通知按规则发送）：
+`tfc restore`（等价 `bash /root/traffic_routing/traffic_ctrl.sh restore`）只做一件事：撤掉 `TRAFFIC_BLOCKED` 跳转与链，把 `state` 里的 `STATE` 改回 `normal`。**不动当月累计、不写档案、不清计数器**，所以月中解封后再超限仍会照常再封。
 
 ```bash
-bash /root/traffic_routing/reset_network.sh
+tfc restore
 # 验证：跳转条数归 0，外网恢复 200
 iptables -L INPUT -n | grep -c TRAFFIC_BLOCKED
 curl -s --max-time 10 -o /dev/null -w '%{http_code}\n' https://www.google.com
 ```
+
+> ⚠️ 不要用 `reset_network.sh` 手动解封：那是**月度重置**脚本，会把「当月已用」当成「上月结存」写进 `archive` 并清零 `netcount` 与 `grand_total` 增量，等于把本月用量洗白、超限从 0 重新算。它只应由每月 1 号的 cron 触发。
 
 ### 3. 解封（备用：手动删规则，只删本脚本的规则，不影响其他程序）
 

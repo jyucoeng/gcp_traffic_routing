@@ -931,7 +931,7 @@ print_usage() {
   set-tg           更换 TG 凭据：TELEGRAM_BOT_TOKEN=xxx TELEGRAM_CHAT_ID=yyy
   clear-tg         停用并清除 TG 凭据
   check            查看流量（跑 check_traffic.sh：查当月上下行 + 超限判定）
-  restore          恢复网络（跑 reset_network.sh：清封网 + 重置统计）
+  restore          立即解封（只撤封网规则并把状态置回 normal，不动当月累计/月度档案）
   update           脚本更新（从 GitHub 拉最新部署器，仅换文件不重装）
   reset-notify     重置本月 TG 发送计数（删 notify 本月行，超限/恢复可重发）
   del              卸载
