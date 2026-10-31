@@ -18,7 +18,7 @@ CDN_CDNIP_FILES="1-cfcdn-ip-15.txt 1-cfcdn-ipv6-7.txt 2-fastly-ip-19.txt 2-fastl
 # 随包离线清单落盘目录（cdn.sh 离线优先读取的默认路径）
 CDN_CDNIP_BUNDLED_DIR="${CDN_CDNIP_BUNDLED_DIR:-/usr/local/share/dae/cdnip}"
 # 发布流程：scripts/build-release-bundle.sh 构建可复现 bundle，其 SHA256 与此处一致
-PACKAGE_SHA256="96b335582758ab90959d08366cfe0a87308956cb64d3e5012aa22a33dc9a181e"
+PACKAGE_SHA256="d4ae45709de524d0306c0fc001dd897228cb5dfc0515ae2c4081a43ea1afa4a5"
 PACKAGE_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/${PROJECT_VERSION}/${PACKAGE_NAME}"
 
 CDN_BIN="/usr/local/bin/cdn"
@@ -64,6 +64,19 @@ install_bundle() {
   local tmpdir root_dir
 
   tmpdir="$(mktemp -d)"
+  # 成员路径校验（防 zip-slip）：SHA256 只保证"是我们发布的那个包"，不能保证包内路径
+  # 不越界；含绝对路径或 `..` 的成员会在解包时写到 $tmpdir 之外（覆盖 /etc 等）。
+  if ! members="$(tar -tzf "$bundle")"; then
+    rm -rf "$tmpdir"
+    echo "发布包无法读取（tar -tzf 失败），已取消安装。" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$members" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    rm -rf "$tmpdir"
+    echo "发布包包含越界路径（绝对路径或 ..），已取消安装：" >&2
+    printf '%s\n' "$members" | grep -E '(^/|(^|/)\.\.(/|$))' | head -n 5 >&2
+    exit 1
+  fi
   tar -xzf "$bundle" -C "$tmpdir"
   root_dir="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
   if [ -z "$root_dir" ]; then

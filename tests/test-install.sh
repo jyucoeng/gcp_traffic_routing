@@ -65,6 +65,19 @@ rm -f "${TMP}/bin2/cdn"
 ( CDN_BIN="${TMP}/bin2/cdn"; install_bundle "${TMP}/bad.tar.gz" ) >/dev/null 2>&1 \
   && bad "install_bundle 放行语法错误脚本" || ok "install_bundle 拒绝语法错误脚本"
 
+# ---------- install_bundle：越界成员路径（zip-slip）拒绝安装 ----------
+mkdir -p "${TMP}/evil/gcp_traffic_routing-v0.1.1"
+cp "${SRC}/cdn.sh" "${TMP}/evil/gcp_traffic_routing-v0.1.1/cdn.sh"
+printf 'pwn\n' >"${TMP}/evil/../../evil-out.txt" 2>/dev/null || true
+( cd "${TMP}/evil" && tar -czf "${TMP}/slip.tar.gz" -P "gcp_traffic_routing-v0.1.1/cdn.sh" "../../evil-out.txt" ) 2>/dev/null \
+  || ( cd "${TMP}/evil" && tar -czf "${TMP}/slip.tar.gz" "gcp_traffic_routing-v0.1.1/cdn.sh" )
+if tar -tzf "${TMP}/slip.tar.gz" 2>/dev/null | grep -q '\.\./'; then
+  ( CDN_BIN="${TMP}/bin3/cdn"; install_bundle "${TMP}/slip.tar.gz" ) >/dev/null 2>&1 \
+    && bad "install_bundle 放行越界路径成员" || ok "install_bundle 拒绝越界路径成员（zip-slip）"
+else
+  ok "（跳过）tar 未能构造越界成员样例"
+fi
+
 # ---------- install_bundle：随包 CDN 网段清单落盘 ----------
 mkdir -p "${TMP}/b2/gcp_traffic_routing-v0.1.1"
 cp "${SRC}/cdn.sh" "${TMP}/b2/gcp_traffic_routing-v0.1.1/cdn.sh"

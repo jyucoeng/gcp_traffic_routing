@@ -105,6 +105,8 @@ CDN_CDNIP_CACHE="${CDN_CDNIP_CACHE:-${DAE_DATA_DIR}/cdnip.txt}"
 # cdn_log_level 控制 dae log_level（默认 debug 以便核对"命中 CDN 缓存/geoip 分流到哪个节点"）；
 # DAE_LOG_FILE 为统一日志文件路径（systemd/openrc 服务均以 --logfile 输出到该文件）。
 CDN_LOG_LEVEL="${cdn_log_level:-debug}"
+# dae allow_insecure：true 兼容自签证书节点；设为 false 则拒绝不合法证书
+CDN_ALLOW_INSECURE="${cdn_allow_insecure:-true}"
 DAE_LOG_FILE="${DAE_LOG_FILE:-/var/log/dae/dae.log}"
 # 分流目标组（组名出现在 dae 日志 outbound= 字段，一眼可辨命中哪一层）：
 #   cdn_cache_group —— 命中本地 CDN 网段缓存（dip('cidr'...) 首层规则）
@@ -469,12 +471,34 @@ cdn_join_cidrs() {
 # 用单引号包裹（dip('2001:db8::/32')），此处对全部 CIDR 统一加引号。
 # 纯函数：缓存缺失时直接输出空（不在此触发下载/写盘），
 # 缓存由 cdn_apply/cdn_install 在写盘前显式经 cdn_fetch_cdnip 生成。
+# CIDR 合法性校验：每段 0-255、前缀长度按地址族取上限。
+# 原实现用一条正则，`999.1.1.1/24` 会被放行（写进 config.dae 后 dae 启动即失败），
+# 而 IPv4-mapped IPv6（::ffff:1.2.3.4/120）因含 `.` 被整体丢弃（该段 CDN 流量不走分流）。
+cdn_valid_cidr() {
+  local cidr="$1" ip plen
+  case "${cidr}" in */*) ;; *) return 1 ;; esac
+  ip="${cidr%/*}"; plen="${cidr##*/}"
+  case "${plen}" in '' | *[!0-9]*) return 1 ;; esac
+  [ "${#plen}" -le 3 ] || return 1
+  case "${ip}" in
+  *:*)
+    printf '%s' "${ip}" | grep -Eq '^[0-9A-Fa-f:.]+$' || return 1
+    [ "${#ip}" -le 45 ] || return 1
+    [ "$((10#${plen}))" -le 128 ]
+    ;;
+  *)
+    printf '%s' "${ip}" | awk -F. 'NF!=4{exit 1} {for(i=1;i<=4;i++){if($i==""||$i+0<0||$i+0>255)exit 1}}' || return 1
+    [ "$((10#${plen}))" -le 32 ]
+    ;;
+  esac
+}
+
 cdn_ipcidr_rules() {
   local group=() n=0 cidr
   [ -s "${CDN_CDNIP_CACHE}" ] || return 0
   while IFS= read -r cidr; do
     [ -z "${cidr}" ] && continue
-    printf '%s' "${cidr}" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$|^[0-9A-Fa-f:]+/([0-9]|[1-9][0-9]|12[0-8])$' || continue
+    cdn_valid_cidr "${cidr}" || continue
     group+=("${cidr}")
     n=$((n + 1))
     if [ "${n}" -ge 25 ]; then
@@ -573,7 +597,9 @@ cdn_render_config() {
     printf '    lan_interface: %s\n' "${lan}"
   fi
   printf '    auto_config_kernel_parameter: true\n'
-  printf '    allow_insecure: true\n'
+  # allow_insecure 允许节点 TLS 证书不受信（自签/域名不匹配）时仍可连。
+  # 安全性要求高的场景可用 cdn_allow_insecure=false 关掉，让 dae 拒绝非法证书。
+  printf '    allow_insecure: %s\n' "${CDN_ALLOW_INSECURE:-true}"
   printf '}\n'
   printf 'dns {\n'
   printf '    upstream {\n'
@@ -608,6 +634,13 @@ cdn_render_config() {
   i=0
   while IFS= read -r line; do
     [ -z "${line}" ] && continue
+    case "${line}" in
+    *"'"*)
+      # 告警必须走 stderr：本函数 stdout 直接重定向为配置文件
+      cdn_print_err "节点含单引号，已跳过（请用 cdn del 后重新添加）：${line:0:60}…"
+      continue
+      ;;
+    esac
     i=$((i + 1))
     printf "    '%s'\n" "${line}"
   done <<<"${nodes}"
@@ -623,6 +656,12 @@ cdn_render_config() {
       label="${BASH_REMATCH[1]}"
       url="${BASH_REMATCH[2]}"
     fi
+    case "${url}" in
+    *"'"*)
+      cdn_print_err "订阅地址含单引号，已跳过（请用 cdn del-sub 后重新添加）：${url:0:60}…"
+      continue
+      ;;
+    esac
     printf "    %s: '%s'\n" "${label}" "${url}"
   done <<<"${subs}"
   printf '}\n'
@@ -703,18 +742,32 @@ cdn_restart_service() {
   case "${INIT_SYSTEM}" in
   systemd)
     systemctl enable "${CDN_SERVICE}" >/dev/null 2>&1 || true
-    systemctl restart "${CDN_SERVICE}"
+    systemctl restart "${CDN_SERVICE}" || true
+    # restart 的退出码不代表进程真的活着：dae 配置/权限/BTF 问题会立刻退出，
+    # 必须等一拍再查 is-active，否则"重启成功"是谎言，用户以为分流已生效。
+    sleep 1
+    if ! systemctl is-active --quiet "${CDN_SERVICE}"; then
+      cdn_print_err "dae 启动失败（systemctl is-active=inactive）。最近日志："
+      journalctl -u "${CDN_SERVICE}" -n 20 --no-pager 2>/dev/null | sed 's/^/    /' || true
+      return 1
+    fi
     ;;
   openrc)
     # 与 systemd 分支对齐：apply 路径也要注册开机自启，否则 cdn add 自动 apply
     # 后服务只重启不入 rc-update，重启机器即失效
     rc-update add "${CDN_SERVICE}" default >/dev/null 2>&1 || true
-    rc-service "${CDN_SERVICE}" restart
+    rc-service "${CDN_SERVICE}" restart || true
+    sleep 1
+    if ! rc-service "${CDN_SERVICE}" status >/dev/null 2>&1; then
+      cdn_print_err "dae 启动失败（rc-service status 非 running），请查看 ${DAE_LOG_FILE}"
+      return 1
+    fi
     ;;
   *)
     cdn_print_warn "无服务管理器，请手动重启 dae（dae run -c ${CDN_CONF} &）。"
     ;;
   esac
+  return 0
 }
 
 cdn_service_ctl() {
@@ -732,7 +785,7 @@ cdn_service_ctl() {
     cdn_fatal "未检测到 systemd/openrc，无法控制系统服务。"
     ;;
   esac
-  cdn_print_ok "已执行 systemctl/openrc ${action}：${CDN_SERVICE}"
+  cdn_print_ok "已执行 ${INIT_SYSTEM} ${action}：${CDN_SERVICE}"
 }
 
 cdn_status() {
@@ -820,6 +873,17 @@ cdn_list() {
   cdn_status || true
 }
 
+# 串行化写操作：并发 add 会重复 append，并发 del/apply 会互相覆盖 mv -f 并轮流重启 dae
+cdn_lock() {
+  mkdir -p "${CDN_DIR}" 2>/dev/null || true
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"${CDN_DIR}/.lock"
+    if ! flock -w 30 8; then
+      cdn_fatal "另一个 cdn 写操作正在进行（等锁 30s 超时），请稍后重试。"
+    fi
+  fi
+}
+
 cdn_add() {
   cdn_add_impl "node" "$@"
 }
@@ -833,6 +897,8 @@ cdn_add_impl() {
   local kind="$1"
   local bad=0
   shift
+  # 锁必须在写 nodes.list/subs.list 之前拿到：放到函数尾部只盖住 apply，等于没锁
+  cdn_lock
   if [ "${kind}" = "node" ]; then
     [ $# -ge 1 ] || cdn_fatal "用法: cdn add '<vless://…>' ['<trojan://…>' …]"
     local link
@@ -841,6 +907,14 @@ cdn_add_impl() {
       link="${link#\'}"
       link="${link%\"}"
       link="${link#\"}"
+      # dae 的 node/subscription 段用单引号包裹字符串，链接内部含 ' 会提前闭合导致配置错乱
+      case "${link}" in
+      *"'"*)
+        cdn_print_warn "跳过含单引号的节点链接（会破坏 dae 配置）：${link:0:60}…"
+        bad=1
+        continue
+        ;;
+      esac
   if ! cdn_valid_link "${link}"; then
     cdn_print_warn "跳过非法节点链接（仅支持 vless/vmess/trojan/hysteria2/tuic/anytls）：${link:0:60}…"
         bad=1
@@ -860,6 +934,12 @@ cdn_add_impl() {
     [ $# -ge 1 ] || cdn_fatal "用法: cdn add-sub '<订阅url>' [标签]"
     local url="${1:-}"
     local label="${2:-}"
+    case "${url}" in
+    *"'"*)
+      cdn_print_warn "订阅地址含单引号（会破坏 dae 配置）：${url:0:60}…"
+      bad=1
+      ;;
+    esac
     case "${url}" in
     http://* | https://*) ;;
     *)
@@ -907,8 +987,11 @@ cdn_del_impl() {
   fi
   [ -f "${file}" ] || cdn_fatal "无可用${kind}列表（缺少 ${file}）。"
   [ -n "${key}" ] || cdn_fatal "匹配条件不能为空。"
-  # 两阶段匹配：数字 key 先全文件找序号（与 cdn list 编号对齐，跳过空行），
-  # 无对应序号时回退为关键字匹配；非数字 key 直接按关键字。
+  cdn_lock
+  # 两阶段匹配：数字 key 先全文件找序号（与 cdn list 编号对齐，跳过空行）。
+  # 数字 key 找不到对应序号时**直接报错**：早期版本会回退成关键字匹配，
+  # 于是 `cdn del 5` 在只有 3 个节点时会去删"链接里含 5"的那个，静默误删。
+  # 非数字 key 仍按关键字匹配。
   if is_num "${key}"; then
     while IFS= read -r line || [ -n "${line}" ]; do
       [ -z "${line}" ] && continue
@@ -918,6 +1001,9 @@ cdn_del_impl() {
         break
       fi
     done <"${file}"
+    if [ "${idx_target}" -eq 0 ]; then
+      cdn_fatal "序号 ${key} 不存在（当前共 ${i} 条，用 cdn list 查看编号）。"
+    fi
   fi
   tmp="$(mktemp)"
   i=0
@@ -967,7 +1053,9 @@ cdn_apply() {
     cdn_fatal "配置生成/校验失败，服务未变更。"
   fi
   cdn_create_service
-  cdn_restart_service
+  if ! cdn_restart_service; then
+    cdn_fatal "配置已写入但 dae 未成功启动，分流未生效（日志：${DAE_LOG_FILE}）。"
+  fi
   cdn_print_ok "CDN 分流配置已生效（${CDN_CACHE_GROUP}=CDN缓存命中 + ${CDN_GEOIP_GROUP}=geoip:cdnip，其余直连，日志：${DAE_LOG_FILE}）。"
 }
 
@@ -995,7 +1083,9 @@ cdn_install() {
   if [ -f "${CDN_NODES}" ] || [ -f "${CDN_SUBS}" ]; then
     cdn_apply
   else
-    cdn_write_config || true
+    if ! cdn_write_config; then
+      cdn_print_err "初始配置生成失败，请检查 dae 与目录权限后执行：cdn apply"
+    fi
     cdn_print_info "已就绪。接下来用 cdn add 添加节点（vless/vmess/trojan/hysteria2/tuic/anytls），流量将按 CDN 网段缓存 + dip(geoip:cdnip) 分流。"
     cdn_print_info "示例: cdn add 'vless://uuid@node.example.com:443?...' 'trojan://pass@node2.example.com:443'"
   fi
@@ -1014,7 +1104,9 @@ cdn_update() {
   if [ -f "${CDN_NODES}" ] || [ -f "${CDN_SUBS}" ]; then
     cdn_apply
   else
-    cdn_write_config || true
+    if ! cdn_write_config; then
+      cdn_print_err "配置生成失败，请检查 dae 与目录权限后执行：cdn apply"
+    fi
   fi
 }
 
@@ -1023,14 +1115,15 @@ cdn_update() {
 cdn_env_preload() {
   local i varname v
   CDN_NO_APPLY=1
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  # 预填上限 100（原 20 且无提示，node21 起静默忽略，与文档 node1..nodeN 不符）
+  for i in $(seq 1 100); do
     varname="node${i}"
     v="${!varname:-}"
     if [ -n "${v}" ]; then
       cdn_add_impl node "${v}"
     fi
   done
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  for i in $(seq 1 100); do
     varname="sub${i}"
     v="${!varname:-}"
     if [ -n "${v}" ]; then
@@ -1055,10 +1148,18 @@ cdn_uninstall() {
     rm -f "${CDN_OPENRC_FILE}"
     ;;
   esac
+  # 只删本管理器安装/生成的东西：整个 rm -rf /usr/local/etc/dae 与 dae 数据目录会连带
+  # 干掉用户自己的 dae 配置与 geoip/其它规则文件（本机若还有别的 dae 用途会被一起废掉）。
   rm -f "${DAE_BIN}"
-  rm -rf "${DAE_DATA_DIR}" /usr/local/etc/dae
+  rm -f "${CDN_CONF}"
+  rmdir "$(dirname "${CDN_CONF}")" 2>/dev/null || true
+  rm -f "${DAE_GEOIP}" "${CDN_CDNIP_CACHE}"
+  rm -rf "${CDN_CDNIP_BUNDLED_DIR}"
   rm -rf "${CDN_DIR}"
-  cdn_print_ok "CDN 分流管理器已全量卸载（dae 服务/二进制/geoip/配置/节点/CDN 网段缓存）。"
+  rm -f "${DAE_LOG_FILE}"
+  rmdir "$(dirname "${DAE_LOG_FILE}")" 2>/dev/null || true
+  rmdir "${DAE_DATA_DIR}" 2>/dev/null || true
+  cdn_print_ok "CDN 分流管理器已卸载（dae 服务/二进制/本项目 geoip·cdnip·config·节点/CDN 网段缓存/日志）。"
 }
 
 cdn_menu_nodes() {

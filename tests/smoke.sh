@@ -360,13 +360,22 @@ else
   bad "del 序号未跳过空行（错位删除）"
 fi
 
-# ---------- 补全：del 数字关键字回退（无对应序号时按关键字） ----------
+# ---------- del 数字 key 无对应序号：报错且不删任何东西 ----------
+# 旧行为是回退成关键字匹配，于是 `cdn del 5` 在只有 3 个节点时会删掉"链接里含 5"的那个。
 CDN_NO_APPLY=1 cdn_add 'trojan://tok44321@6.7.8.9:8443#x' >/dev/null 2>&1
-cdn_del '44321' >/dev/null 2>&1
-if ! grep -qxF 'trojan://tok44321@6.7.8.9:8443#x' "${CDN_NODES}"; then
-  ok "del 数字关键字回退匹配（44321 无对应序号，按关键字删除）"
+if (cdn_del '44321') >/dev/null 2>&1; then
+  bad "del 不存在的序号未报错（仍在回退关键字匹配）"
+elif grep -qxF 'trojan://tok44321@6.7.8.9:8443#x' "${CDN_NODES}"; then
+  ok "del 不存在的序号报错且不误删（不再回退关键字）"
 else
-  bad "del 数字关键字未回退匹配"
+  bad "del 不存在的序号把节点误删了"
+fi
+
+# ---------- del 非数字关键字：仍按关键字删除 ----------
+if (cdn_del 'tok44321') >/dev/null 2>&1 && ! grep -qF 'tok44321' "${CDN_NODES}"; then
+  ok "del 非数字关键字仍按关键字删除"
+else
+  bad "del 非数字关键字删除失败"
 fi
 
 # ---------- 补全：vmess 单独节点也触发 dae validate（校验守卫覆盖 6 协议） ----------
