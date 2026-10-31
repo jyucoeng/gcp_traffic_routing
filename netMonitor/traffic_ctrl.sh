@@ -81,12 +81,21 @@ TFC_NAME="${TFC_NAME:-tfc}"
 CONF_FILE="${CONF_FILE:-$CONF_DIR/netMonitor.conf}"
 # TG 凭据加密密钥文件（0600，root-only；丢失后凭据不可恢复，需重新 set-tg）
 NETMON_KEY="${NETMON_KEY:-$CONF_DIR/netMonitor.key}"
+# 运行时状态文件（真实值由生成的 check/reset 脚本写入；此处供 tfc restore 等主脚本操作复用）
+STATE_FILE="${STATE_FILE:-/var/lib/traffic_monitor/state}"
 # 流量监控日志保留天数：每月 1 号 reset_network.sh 清理时，只保留最近 N 天的日志行，
 # 删除 N 天以前的旧日志（默认 7 天）；0/-1 = 保留全部不清理。
+# 保留天数只接受 -1(不清理) / 0(不清理) / 1-4 位正整数。
+# 旧写法 `''|*[!0-9-]*|-` 会把 "--5"、"5-3"、"1-2-3" 当成合法值放进 find -mtime。
+valid_retention_days() {
+    case "$1" in
+        -1|0) return 0 ;;
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "${#1}" -le 4 ] && [ "$1" -ge 1 ]
+}
 LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
-case "$LOG_RETENTION_DAYS" in
-    ''|*[!0-9-]*|-) LOG_RETENTION_DAYS=7 ;;
-esac
+if ! valid_retention_days "$LOG_RETENTION_DAYS"; then LOG_RETENTION_DAYS=7; fi
 # ==========================================
 
 # TG 通知开关：两者均非空才启用
@@ -219,6 +228,7 @@ uninstall() {
     # 卸载清除本月状态(state)与 TG 发送历史(notify)；本月流量计数(netcount)保留 --
     # 覆盖式重装后继续累计当月实时流量；notify 清空后同月重装会重新发送通知（视为全新部署）
     rm -f /var/lib/traffic_monitor/state /var/lib/traffic_monitor/notify 2>/dev/null || true
+    rm -f /var/lib/traffic_monitor/prev_month 2>/dev/null || true
     rm -f /var/log/traffic_monitor.log /var/log/network_reset.log 2>/dev/null || true
     rm -f /var/log/netMonitor_check.log /var/log/netMonitor_reset.log 2>/dev/null || true
     echo "  -> 状态与日志已清理（月度档案保留）。"
@@ -438,9 +448,10 @@ config_edit() {
     HAS_V6="${HAS_V6:-1}"
     LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
     case "$STAT_MODE" in out|in|max|min|sum) : ;; *) STAT_MODE=sum ;; esac
-    case "$LOG_RETENTION_DAYS" in
-        ''|*[!0-9-]*|-) LOG_RETENTION_DAYS=7 ;;
-    esac
+    if ! valid_retention_days "$LOG_RETENTION_DAYS"; then
+        LOG_RETENTION_DAYS=7
+        echo "日志保留天数非法（仅支持 -1/0/正整数），已用默认 7 天。" >&2
+    fi
 
     # 解密现有 TG 以便编辑后原样回写（不输入即保留）
     local t c
@@ -686,13 +697,35 @@ menu_check() {
     fi
 }
 # 恢复网络：直接跑运行时 reset 脚本（清封网 + 重置统计 + 归档；未部署时提示）
+# 立即解封（只撤防火墙 + 状态改回 normal）
+# 注意：这里绝不能用 reset_network.sh —— 那是"月度重置"，会把当月已用流量当成
+# 上月结存写进档案并清零计数器，月中点一次"恢复网络"就等于把本月用量洗白了。
+restore_now() {
+    require_root
+    local _FW _CHAIN _n=0
+    for _FW in iptables ip6tables; do
+        command -v "$_FW" >/dev/null 2>&1 || continue
+        for _CHAIN in INPUT OUTPUT FORWARD; do
+            "$_FW" -D "$_CHAIN" -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null && _n=$((_n + 1))
+            "$_FW" -D "$_CHAIN" -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null && _n=$((_n + 1))
+            "$_FW" -D "$_CHAIN" -j TRAFFIC_BLOCKED 2>/dev/null && _n=$((_n + 1))
+        done
+        "$_FW" -F TRAFFIC_BLOCKED 2>/dev/null || true
+        "$_FW" -X TRAFFIC_BLOCKED 2>/dev/null || true
+    done
+    if [ -f "$STATE_FILE" ]; then
+        # 只改 STATE 行，保留 MONTH/累计/封网月份（reset 仍能据此发恢复通知）
+        sed -i 's/^STATE=.*/STATE=normal/' "$STATE_FILE" 2>/dev/null || true
+    fi
+    echo "--> 已解除封网（清理跳转规则 ${_n} 条），状态置为 normal；当月累计与月度档案未改动。"
+    echo "    如仍无法出网，请检查是否还有其它防火墙规则：iptables -S | grep -v TRAFFIC_BLOCKED"
+}
+
 menu_restore() {
-    if [ -x "$SCRIPT_DIR/reset_network.sh" ]; then
-        bash "$SCRIPT_DIR/reset_network.sh"
-    elif [ -x /root/traffic_routing/reset_network.sh ]; then
-        bash /root/traffic_routing/reset_network.sh
+    if command -v iptables >/dev/null 2>&1 || [ -f "$STATE_FILE" ]; then
+        restore_now
     else
-        echo "未找到 reset_network.sh，请先部署（菜单 1）。"
+        echo "未检测到防火墙或状态文件，请先部署（菜单 1）。"
     fi
 }
 # 脚本更新：从 GitHub 拉最新部署器，校验后覆盖 $0 与落盘副本、重建 tfc 链接，
@@ -1055,11 +1088,13 @@ cat > "$SCRIPT_DIR/netstat.sh" <<'NETSTAT'
 #   netstat.sh --in       只输出当月下行累计 (单值)
 #   netstat.sh --reset    清零当月累计 (每月1号由 reset_network.sh 调用)
 #   netstat.sh --current  输出当前网卡累计快照 (调试用)
+#   netstat.sh --final    只读输出当前计费月的最终累计 (不清零/不推进快照, 供 reset 归档)
 #   每次调用都是"采样"：会推进快照、更新/持久化状态。状态文件: /var/lib/traffic_monitor/netcount
 
 set -u
 STATE_DIR="/var/lib/traffic_monitor"
 COUNT_FILE="$STATE_DIR/netcount"
+PREV_FILE="$STATE_DIR/prev_month"
 CUR_MONTH=$(date '+%Y-%m')
 
 # 读 /proc/net/dev, 对所有"非虚拟"网卡分别按 RX(第2列) / TX(第10列) 求和
@@ -1079,18 +1114,40 @@ current_counters() {
 }
 
 mkdir -p "$STATE_DIR"
+# 串行化：cron 的 check_traffic.sh 与手动 `tfc check` 可能并发，无锁会互相截断状态文件
+if command -v flock >/dev/null 2>&1; then
+    exec 9>"$STATE_DIR/netcount.lock"
+    flock -w 10 9 2>/dev/null || true
+fi
 read -r CUR_TX CUR_RX <<< "$(current_counters)"
 
 # 读取上次状态
 LAST_TX=0; LAST_RX=0; MONTH_TX=0; MONTH_RX=0; MONTH=""
 [ -f "$COUNT_FILE" ] && . "$COUNT_FILE"
 
-# 跨月: 清零当月累计 (新计费周期), 快照保留为下次 delta 基准
-if [ "$MONTH" != "$CUR_MONTH" ]; then
+# --final: 只读输出状态文件里"那个计费月"的最终累计，供 reset 归档使用。
+# 不采样、不推进快照、不跨月清零、不写状态文件 —— 纯读，可安全重复调用。
+if [ "${1:-}" = "--final" ]; then
+    echo "$MONTH_TX $MONTH_RX"
+    exit 0
+fi
+
+# 跨月: 先把上月最终累计落盘到 prev_month(供 reset_network.sh 归档)，再清零进入新周期。
+# 落盘这步是关键：cron 的 check(*/5) 与 reset(每月1号 00:00) 同一分钟触发，
+# 谁先跑都会经过这里，reset 因此总能拿到真实的上月总量(而不是清零后的 0)。
+if [ "$MONTH" != "$CUR_MONTH" ] && [ -n "$MONTH" ]; then
+    if printf 'MONTH=%s\nTX=%s\nRX=%s\n' "$MONTH" "$MONTH_TX" "$MONTH_RX" > "$PREV_FILE.tmp" 2>/dev/null \
+        && mv -f "$PREV_FILE.tmp" "$PREV_FILE" 2>/dev/null; then
+        :
+    else
+        rm -f "$PREV_FILE.tmp" 2>/dev/null || true
+    fi
     MONTH_TX=0
     MONTH_RX=0
     MONTH="$CUR_MONTH"
 fi
+# 首次部署(netcount 不存在)时 MONTH 为空：直接落到当前计费月，避免写出 "MONTH=" 的空值
+[ -n "$MONTH" ] || MONTH="$CUR_MONTH"
 
 if [ "${1:-}" = "--reset" ]; then
     MONTH_TX=0
@@ -1098,25 +1155,23 @@ if [ "${1:-}" = "--reset" ]; then
     MONTH="$CUR_MONTH"
     LAST_TX=$CUR_TX
     LAST_RX=$CUR_RX
-    cat > "$COUNT_FILE" <<EOF
-MONTH=$MONTH
-MONTH_TX=$MONTH_TX
-MONTH_RX=$MONTH_RX
-LAST_TX=$LAST_TX
-LAST_RX=$LAST_RX
-EOF
+    printf 'MONTH=%s\nMONTH_TX=%s\nMONTH_RX=%s\nLAST_TX=%s\nLAST_RX=%s\n' \
+        "$MONTH" "$MONTH_TX" "$MONTH_RX" "$LAST_TX" "$LAST_RX" > "$COUNT_FILE.tmp" \
+        && mv -f "$COUNT_FILE.tmp" "$COUNT_FILE"
     echo "0 0"
     exit 0
 fi
 
-# 求增量: 快照回绕(重启)时 delta 归零重计, 与 nezha min() 语义一致 (上下行独立)
+# 求增量: 无快照(首次部署/netcount 丢失)或计数器回绕(重启)时，只把当前值当作新基准，
+# 增量记 0 —— 绝不能回补 CUR_TX：/proc/net/dev 是"开机以来"累计，首次采样回补会把
+# 历史总量一次性计入当月，直接触发误封网。上下行独立判断。
 if [ "$LAST_TX" -eq 0 ] || [ "$CUR_TX" -lt "$LAST_TX" ]; then
-    DELTA_TX=$CUR_TX
+    DELTA_TX=0
 else
     DELTA_TX=$(( CUR_TX - LAST_TX ))
 fi
 if [ "$LAST_RX" -eq 0 ] || [ "$CUR_RX" -lt "$LAST_RX" ]; then
-    DELTA_RX=$CUR_RX
+    DELTA_RX=0
 else
     DELTA_RX=$(( CUR_RX - LAST_RX ))
 fi
@@ -1125,13 +1180,9 @@ MONTH_RX=$(( MONTH_RX + DELTA_RX ))
 LAST_TX=$CUR_TX
 LAST_RX=$CUR_RX
 
-cat > "$COUNT_FILE" <<EOF
-MONTH=$MONTH
-MONTH_TX=$MONTH_TX
-MONTH_RX=$MONTH_RX
-LAST_TX=$LAST_TX
-LAST_RX=$LAST_RX
-EOF
+printf 'MONTH=%s\nMONTH_TX=%s\nMONTH_RX=%s\nLAST_TX=%s\nLAST_RX=%s\n' \
+    "$MONTH" "$MONTH_TX" "$MONTH_RX" "$LAST_TX" "$LAST_RX" > "$COUNT_FILE.tmp" \
+    && mv -f "$COUNT_FILE.tmp" "$COUNT_FILE"
 
 case "${1:-}" in
     --out) echo "$MONTH_TX" ;;
@@ -1569,6 +1620,25 @@ if [ "\$MONTH" != "\$CUR_MONTH" ]; then
     RESTORED_TIME=""
 fi
 
+# 解除本脚本的封网规则（只删自家 TRAFFIC_BLOCKED 链与三条主链上的跳转，
+# 不动其它程序规则/默认策略）。流量回落时必须调用，否则 state 写 normal 而实际仍断网。
+unblock_one_fw() {
+    local _fw="\$1" _c
+    command -v "\$_fw" >/dev/null 2>&1 || return 0
+    for _c in INPUT OUTPUT FORWARD; do
+        "\$_fw" -D "\$_c" -m comment --comment "TRAFFIC_BLOCKED: 脚本封网(仅SSH/DNS/lo)" -j TRAFFIC_BLOCKED 2>/dev/null || true
+        "\$_fw" -D "\$_c" -m comment --comment "TRAFFIC_BLOCKED: 脚本仅断出站(SSH/DNS/lo 除外)" -j TRAFFIC_BLOCKED 2>/dev/null || true
+        "\$_fw" -D "\$_c" -j TRAFFIC_BLOCKED 2>/dev/null || true
+    done
+    "\$_fw" -F TRAFFIC_BLOCKED 2>/dev/null || true
+    "\$_fw" -X TRAFFIC_BLOCKED 2>/dev/null || true
+}
+unblock_fw_all() {
+    [ "\$HAS_V4" = "1" ] && unblock_one_fw iptables
+    [ "\$HAS_V6" = "1" ] && unblock_one_fw ip6tables
+    return 0
+}
+
 # 保存当月状态到文件（附带本次判定的快照：流量口径/上限/上下行/计费流量，
 # 看 state 一眼可知：这个月用了多少、是否断网、口径和上限是多少）
 save_state() {
@@ -1579,6 +1649,7 @@ STATE=\$STATE
 BLOCKED_TIME="\$BLOCKED_TIME"
 BLOCKED_TX="\$BLOCKED_TX"
 RESTORED_TIME="\$RESTORED_TIME"
+BLOCKED_MONTH="\${BLOCKED_MONTH:-}"
 USED_STAT_MODE=\$STAT_MODE
 USED_LIMIT=\$LIMIT
 USED_TX=\$MONTH_TX
@@ -1607,6 +1678,7 @@ if [ \$(echo "\$BAL_BYTES >= \$LIMIT_BYTES" | bc) -eq 1 ]; then
         STATE=blocked
         BLOCKED_TIME=\$(date '+%Y-%m-%d %H:%M:%S')
         BLOCKED_TX="\$BAL_BYTES"
+        BLOCKED_MONTH="\$CUR_MONTH"
         save_state
     fi
     if [ "\$STATE" = "blocked" ]; then
@@ -1716,9 +1788,11 @@ else
     # 流量回落则状态归位 normal (超限通知标记不清零：同月再超限只封网不重发；
     # 恢复通知由 reset 触发，此处不发)
     if [ "\$STATE" = "blocked" ]; then
+        unblock_fw_all
         STATE=normal
+        BLOCKED_MONTH="\$CUR_MONTH"
         save_state
-        log "检测到流量回落，状态恢复正常 (超限通知标记保留，同月再超限不重发)。"
+        log "检测到流量回落，已解除封网并恢复正常 (超限通知标记保留，同月再超限不重发)。"
     else
         save_state
         log "流量正常。"
@@ -1737,6 +1811,7 @@ CONF_FILE="$CONF_FILE"
 NETMON_KEY="$NETMON_KEY"
 SCRIPT_DIR="$SCRIPT_DIR"
 RESET_LOG="/var/log/network_reset.log"
+PREV_FILE="/var/lib/traffic_monitor/prev_month"
 LOG_FILE="/var/log/traffic_monitor.log"
 STATE_FILE="/var/lib/traffic_monitor/state"
 # TG 发送历史 (与 check 共用同一文件：一行一月 UTC 时间戳，OVER 超限 / RESTORE 恢复)；
@@ -1969,15 +2044,24 @@ get_ip_and_loc() {
     echo "\${masked}|\${loc}|\${ip}"
 }
 
-# 采样当月上下行累计 (返回 "上行(TX) 下行(RX)" 两值)
-# 数据来源: 独立统计脚本 netstat.sh (与 check 共用同一份, nezha 式 /proc/net/dev + 月度增量)
-# 注意: 必须在 reset 前调用一次 (采样当月最终值), reset 会清零计数。
+# 取"上一个计费月"的最终上下行累计 (LAST_MONTH_TX/RX) 与月份 (PREV_MONTH)
+# 优先读 netstat.sh 跨月时落盘的 prev_month：cron 的 check(*/5) 与 reset(每月1号00:00)
+# 同一分钟触发，若 check 先跑，净计数已被清零，直接读 netcount 只能拿到 0（上月数据永久丢失）。
+# 未跨月(reset 先跑)时回退 netstat.sh --final：纯读，不清零、不推进快照。
 NETSTAT_BIN="\$SCRIPT_DIR/netstat.sh"
 read_traffic_last() {
     local out
-    out=\$("$NETSTAT_BIN" 2>/dev/null)
-    LAST_MONTH_TX=\${out%% *}
-    LAST_MONTH_RX=\${out##* }
+    PREV_MONTH=""
+    if [ -r "\$PREV_FILE" ]; then
+        PREV_MONTH=\$(sed -n 's/^MONTH=//p' "\$PREV_FILE" 2>/dev/null | tail -n1)
+        LAST_MONTH_TX=\$(sed -n 's/^TX=//p' "\$PREV_FILE" 2>/dev/null | tail -n1)
+        LAST_MONTH_RX=\$(sed -n 's/^RX=//p' "\$PREV_FILE" 2>/dev/null | tail -n1)
+    else
+        out=\$("$NETSTAT_BIN" --final 2>/dev/null)
+        LAST_MONTH_TX=\${out%% *}
+        LAST_MONTH_RX=\${out##* }
+        PREV_MONTH=\$(sed -n 's/^MONTH=//p' /var/lib/traffic_monitor/netcount 2>/dev/null | tail -n1)
+    fi
     if ! [[ "\$LAST_MONTH_TX" =~ ^[0-9]+$ ]]; then LAST_MONTH_TX=0; fi
     if ! [[ "\$LAST_MONTH_RX" =~ ^[0-9]+$ ]]; then LAST_MONTH_RX=0; fi
 }
@@ -2076,7 +2160,8 @@ log "已移除本脚本的封网规则 (TRAFFIC_BLOCKED)，网络恢复。"
 read_traffic_last
 # 3.1 归档"上个月"最终上下行到月度档案 (长期留存, 一行一月, 同一月只追加一次)
 #    月份取 netstat.sh 状态文件中的 MONTH (此时尚未 reset, 仍是上月标识, 与本次归档的数值同月)
-ARCH_MONTH="\$(sed -n 's/^MONTH=//p' /var/lib/traffic_monitor/netcount 2>/dev/null | tail -n1)"
+ARCH_MONTH="\${PREV_MONTH:-}"
+[ -n "\$ARCH_MONTH" ] || ARCH_MONTH="\$(sed -n 's/^MONTH=//p' /var/lib/traffic_monitor/netcount 2>/dev/null | tail -n1)"
 if [ -n "\$ARCH_MONTH" ] && ! grep -q "^[[:space:]]*\$ARCH_MONTH[[:space:]]" "\$ARCHIVE_FILE" 2>/dev/null; then
     mkdir -p "\$(dirname "\$ARCHIVE_FILE")"
     # 字段: 月份 TX=上月上流 RX=上月下流 mode=计费口径 blocked=上月是否触发封网(blocked=触发 normal=未触发)
@@ -2106,6 +2191,7 @@ if [ -n "\$ARCH_MONTH" ] && ! grep -q "^[[:space:]]*\$ARCH_MONTH[[:space:]]" "\$
             done
         fi
         printf 'TOTAL_TX=%s TOTAL_RX=%s MONTH=%s\n' "\$NEW_GD_TX" "\$NEW_GD_RX" "\$ARCH_MONTH" > "\$GRAND_TOTAL_FILE"
+        rm -f "\$PREV_FILE" 2>/dev/null || true
         log "总计流量已更新: 从开始到现在 上行 \$(format_traffic "\$NEW_GD_TX") / 下行 \$(format_traffic "\$NEW_GD_RX") (截至 \$ARCH_MONTH)"
     else
         log "总计流量本月已计入或月份无效，跳过。"
@@ -2126,7 +2212,9 @@ sleep 1
 # 判定是否需要发恢复通知：上月确实超限封网过 + TG 启用 + 当月未发送过恢复通知
 # (以 notify 历史为准；上月月份与恢复月份天然不同月，无需额外比对)
 NEED_RESTORE=0
-if [ "\$STATE" = "blocked" ] && [ "\$TG_ON" = "1" ] && ! notify_restore_sent; then
+# 上月是否值得发恢复通知：仍处 blocked，或本月曾封网后被 check 提前解封(BLOCKED_MONTH)
+if { [ "\$STATE" = "blocked" ] || [ "\${BLOCKED_MONTH:-}" = "\$ARCH_MONTH" ]; } \
+    && [ "\$TG_ON" = "1" ] && ! notify_restore_sent; then
     NEED_RESTORE=1
 fi
 
@@ -2147,6 +2235,7 @@ STATE=\$STATE
 BLOCKED_TIME="\$BLOCKED_TIME"
 BLOCKED_TX="\$BLOCKED_TX"
 RESTORED_TIME="\$RESTORED_TIME"
+BLOCKED_MONTH=""
 USED_STAT_MODE=\$USED_STAT_MODE
 USED_LIMIT=\$USED_LIMIT
 USED_TX=\$USED_TX
@@ -2255,7 +2344,7 @@ IFS='|' read -r MASKED_IP LOC FULL_IP <<< "\$(get_ip_and_loc)"
     RESTORE_TS="\$(notify_mark RESTORE)"
     log "已发送网络恢复 TG 通知 (\$RESTORE_TS)。"
 else
-    if [ "\$STATE" != "blocked" ]; then
+    if [ "\$STATE" != "blocked" ] && [ "\${BLOCKED_MONTH:-}" != "\$ARCH_MONTH" ]; then
         log "上月网络正常，无需发送恢复通知。"
     elif [ "\$TG_ON" != "1" ]; then
         log "TG 未启用，跳过恢复通知。"
@@ -2272,20 +2361,22 @@ quick_install || echo "--> 警告：快捷指令创建失败，不影响部署�
 
 # 7. 设置定时任务
 echo "--> 更新 Crontab 定时任务..."
-crontab -l > /tmp/cron_bk 2>/dev/null
+CRON_TMP="$(mktemp /tmp/cron.XXXXXX)"
+crontab -l > "$CRON_TMP" 2>/dev/null || true
+chmod 600 "$CRON_TMP"
 
 # 清理旧任务，防止重复（含旧版 /root 直放路径的残留）
-sed -i '/check_traffic.sh/d' /tmp/cron_bk
-sed -i '/reset_network.sh/d' /tmp/cron_bk
+sed -i '/check_traffic.sh/d' "$CRON_TMP"
+sed -i '/reset_network.sh/d' "$CRON_TMP"
 
 # 添加新任务
 # 每5分钟检查一次流量
-echo "*/5 * * * * $SCRIPT_DIR/check_traffic.sh" >> /tmp/cron_bk
+echo "*/5 * * * * $SCRIPT_DIR/check_traffic.sh" >> "$CRON_TMP"
 # 每月1号 00:00 重置网络和日志
-echo "0 0 1 * * $SCRIPT_DIR/reset_network.sh" >> /tmp/cron_bk
+echo "0 0 1 * * $SCRIPT_DIR/reset_network.sh" >> "$CRON_TMP"
 
-crontab /tmp/cron_bk
-rm /tmp/cron_bk
+crontab "$CRON_TMP"
+rm -f "$CRON_TMP"
 
 # 确保 cron 服务运行 (Debian/Ubuntu 一般默认开启；Alpine busybox crond 需显式启动)
 if [ "$SVC_MGR" = "openrc" ]; then
